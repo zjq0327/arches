@@ -220,6 +220,11 @@ public:
 		//Arch
 		set_param("arch-name", "TRaX");
 		set_param("max-rays", 128);
+		set_param("node-prefetch-depth", 0);
+		set_param("prefetch-queue-size", 16);
+		set_param("prefetch-mshr-limit", 8);
+		set_param("validate-hits", 0);
+		set_param("hit-output", "");
 
 		//Workload
 		set_param("dataset-dir", "./datasets");
@@ -245,6 +250,19 @@ public:
 			std::string value = arg.substr(split_pos, arg.size() - split_pos);
 
 			parse_param(key, value);
+		}
+
+		if(get_int("node-prefetch-depth") < 0 || get_int("node-prefetch-depth") > 2 ||
+		   get_int("prefetch-queue-size") < 2 || get_int("prefetch-mshr-limit") < 0)
+		{
+			fprintf(stderr, "Invalid prefetch configuration: depth must be 0..2, queue >= 2, MSHR limit >= 0\n");
+			std::exit(EXIT_FAILURE);
+		}
+
+		if(get_int("validate-hits") && !get_int("pregen-rays"))
+		{
+			fprintf(stderr, "validate-hits requires pregen-rays=1 for identical host/device ray inputs\n");
+			std::exit(EXIT_FAILURE);
 		}
 
 		set_param("arch-id", -1);

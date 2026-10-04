@@ -23,6 +23,9 @@ public:
 		uint cache_port{0};
 		uint num_cache_ports{1};
 		uint cache_port_stride{1};
+		uint node_prefetch_depth{0};
+		uint prefetch_queue_size{16}; // 32-byte sectors
+		std::function<void(const rtm::Ray&, const rtm::Hit&)> hit_observer{};
 	};
 
 private:
@@ -95,6 +98,15 @@ private:
 
 		bool done;
 
+		// One scan reads only the stack visible immediately after its pop.
+		uint64_t prefetch_epoch{0};
+		uint8_t prefetch_scan_stack_size{0};
+		uint8_t prefetch_scan_next{0};
+		uint8_t prefetch_scan_count{0};
+		bool prefetch_scan_queued{false};
+		bool prefetch_first_valid{false};
+		StackEntry prefetch_first_snapshot;
+
 		RayState() {};
 	};
 
@@ -105,6 +117,14 @@ private:
 		uint16_t ray_id;
 	};
 
+	struct PrefetchItem
+	{
+		paddr_t addr;
+		uint ray_id;
+		uint64_t epoch;
+		uint8_t cache_mask;
+	};
+
 	//interconnects
 	RequestCascade _request_network;
 	ReturnCascade _return_network;
@@ -113,6 +133,14 @@ private:
 	uint _cache_port_stride;
 
 	std::vector<std::queue<MemoryRequest>> _cache_fetch_queues;
+	// One additional read-only stack port serves at most one candidate per global cycle.
+	std::queue<uint> _prefetch_scan_queue;
+	std::deque<PrefetchItem> _prefetch_queue;
+	std::set<paddr_t> _queued_prefetch_sectors;
+	uint _node_prefetch_depth;
+	uint _prefetch_queue_size;
+	uint _next_prefetch_cache_port{0};
+	bool _prefetch_stack_read_used{false};
 	
 	//ray scheduling hardware
 	std::queue<uint> _ray_scheduling_queue;
@@ -137,6 +165,7 @@ private:
 	paddr_t _node_base_addr;
 	paddr_t _tri_base_addr;
 	paddr_t _vrt_base_addr;
+	std::function<void(const rtm::Ray&, const rtm::Hit&)> _hit_observer;
 	uint _last_ray_id{0};
 	
 	std::set<uint> _rows_accessed;
@@ -186,7 +215,10 @@ private:
 	bool _try_queue_node(uint ray_id, uint node_id);
 	bool _try_queue_tri(uint ray_id, uint tri_id);
 	bool _try_queue_vrts(uint ray_id);
-	bool _try_queue_prefetch(paddr_t addr, uint size, uint cache_mask);
+	bool _try_queue_prefetch(uint ray_id, paddr_t addr, uint size, uint cache_mask);
+	void _invalidate_node_prefetch(uint ray_id);
+	void _begin_node_prefetch_scan(uint ray_id);
+	void _scan_node_prefetch_candidate();
 
 	void _read_requests();
 	void _read_returns();
@@ -216,6 +248,12 @@ public:
 				uint64_t hits_returned;
 				uint64_t issue_counters[(uint)IssueType::NUM_TYPES];
 				uint64_t stall_counters[(uint)RayState::Phase::NUM_PHASES];
+				uint64_t prefetch_candidates;
+				uint64_t prefetch_queued_sectors;
+				uint64_t prefetch_dropped_sectors;
+				uint64_t prefetch_issued_sectors;
+				uint64_t node_fetch_ray_cycles;
+				uint64_t tri_fetch_ray_cycles;
 			};
 			uint64_t counters[NUM_COUNTERS];
 		};
@@ -268,6 +306,12 @@ public:
 			printf("Strips/Ray: %.2f\n", (double)strips / rays);
 			printf("Tris/Ray: %.2f\n", (double)tris / rays);
 			printf("Restarts/Ray: %.2f\n", (double)restarts / rays);
+			printf("Node Fetch Ray-Cycles: %llu\n", static_cast<unsigned long long>(node_fetch_ray_cycles / num_units));
+			printf("Tri Fetch Ray-Cycles: %llu\n", static_cast<unsigned long long>(tri_fetch_ray_cycles / num_units));
+			printf("Prefetch Candidates: %llu\n", static_cast<unsigned long long>(prefetch_candidates / num_units));
+			printf("Prefetch Queued Sectors: %llu\n", static_cast<unsigned long long>(prefetch_queued_sectors / num_units));
+			printf("Prefetch Dropped Sectors: %llu\n", static_cast<unsigned long long>(prefetch_dropped_sectors / num_units));
+			printf("Prefetch Issued Sectors: %llu\n", static_cast<unsigned long long>(prefetch_issued_sectors / num_units));
 
 			uint64_t issue_total = 0;
 			std::vector<std::pair<const char*, uint64_t>> _issue_counter_pairs;

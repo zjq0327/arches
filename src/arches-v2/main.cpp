@@ -1,4 +1,7 @@
 #include "stdafx.hpp"
+#include <array>
+#include <iomanip>
+#include <limits>
 
 #include "shared-utils.hpp"
 #include "units/trax/unit-tp.hpp"
@@ -147,7 +150,69 @@ typedef Units::UnitCache UnitL1Cache;
 typedef rtm::FTB PrimBlocks;
 typedef Units::TRaX::UnitRTCore<rtm::CWBVH::Node, PrimBlocks> UnitRTCore;
 
-static TRaXKernelArgs initilize_buffers(Units::UnitMainMemoryBase** drams, const Units::UnitCrossbar& xbar, paddr_t& heap_address, const SimulationConfig& sim_config, uint page_size)
+struct HitReference
+{
+	rtm::Hit hit;
+	uint count{0};
+};
+
+struct HitAuditRecord
+{
+	rtm::Ray ray;
+	rtm::Hit hit;
+};
+
+static std::string ray_key(const rtm::Ray& ray)
+{
+	return std::string(reinterpret_cast<const char*>(&ray), sizeof(ray));
+}
+
+// Coplanar overlapping faces can have equally close valid hits with different IDs.
+// Verify the actual primitive independently before accepting such a reference tie.
+static bool equivalent_hit_tie(const HitAuditRecord& record, const rtm::Hit& reference,
+                               const std::vector<rtm::Triangle>& triangles, const std::vector<uint>& materials)
+{
+	const uint a = record.hit.id, b = reference.id;
+	if(a == b || a >= triangles.size() || b >= triangles.size() ||
+	   a >= materials.size() || b >= materials.size() || materials[a] != materials[b]) return false;
+	const float distance_tolerance = 4.0f * std::numeric_limits<float>::epsilon() * std::max(1.0f, std::abs(reference.t));
+	if(std::abs(record.hit.t - reference.t) > distance_tolerance) return false;
+
+	const auto normal = [](const rtm::Triangle& tri)
+	{
+		std::array<double, 3> u{}, v{};
+		for(uint i = 0; i < 3; ++i)
+		{
+			u[i] = double(tri.vrts[1][i]) - tri.vrts[0][i];
+			v[i] = double(tri.vrts[2][i]) - tri.vrts[0][i];
+		}
+		return std::array<double, 3>{u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0]};
+	};
+	const auto na = normal(triangles[a]), nb = normal(triangles[b]);
+	double aa = 0, bb = 0, ab = 0, coordinate_scale = 1;
+	for(uint i = 0; i < 3; ++i) { aa += na[i]*na[i]; bb += nb[i]*nb[i]; ab += na[i]*nb[i]; }
+	if(aa == 0 || bb == 0 || std::abs(ab) / std::sqrt(aa*bb) < 1.0 - 1e-10) return false;
+	for(uint j = 0; j < 3; ++j)
+		for(uint i = 0; i < 3; ++i)
+			coordinate_scale = std::max(coordinate_scale, std::max(std::abs(double(triangles[a].vrts[j][i])), std::abs(double(triangles[b].vrts[j][i]))));
+	for(uint j = 0; j < 3; ++j)
+	{
+		double plane_gap = 0;
+		for(uint i = 0; i < 3; ++i) plane_gap += na[i] * (double(triangles[b].vrts[j][i]) - triangles[a].vrts[0][i]);
+		if(std::abs(plane_gap) / std::sqrt(aa) > 1e-10 * coordinate_scale) return false;
+	}
+
+	rtm::Hit actual_geometry(record.ray.t_max, rtm::vec2(0.0f), ~0u);
+	rtm::Hit reference_geometry(record.ray.t_max, rtm::vec2(0.0f), ~0u);
+	if(!rtm::intersect(triangles[a], record.ray, actual_geometry) ||
+	   !rtm::intersect(triangles[b], record.ray, reference_geometry)) return false;
+	return std::abs(actual_geometry.t - record.hit.t) <= distance_tolerance &&
+	       std::abs(reference_geometry.t - reference.t) <= distance_tolerance &&
+	       std::abs(actual_geometry.bc.x - record.hit.bc.x) <= 1e-5f &&
+	       std::abs(actual_geometry.bc.y - record.hit.bc.y) <= 1e-5f;
+}
+
+static TRaXKernelArgs initilize_buffers(Units::UnitMainMemoryBase** drams, const Units::UnitCrossbar& xbar, paddr_t& heap_address, const SimulationConfig& sim_config, uint page_size, std::map<std::string, HitReference>* expected_hits = nullptr, std::vector<rtm::Triangle>* validation_triangles = nullptr, std::vector<uint>* validation_materials = nullptr)
 {
 	std::string scene_name = sim_config.get_string("scene-name");
 	std::string project_folder = get_project_folder_path();
@@ -181,6 +246,24 @@ static TRaXKernelArgs initilize_buffers(Units::UnitMainMemoryBase** drams, const
 		pregen_rays(&bvh.nodes[0], &bvh.ftbs[0], mesh, args.framebuffer_width, args.framebuffer_height, args.camera, pregen_bounce, rays);
 	#endif
 		args.rays = write_vector(drams, xbar, 256, rays, heap_address);
+	}
+
+	if(expected_hits)
+	{
+		mesh.get_triangles(*validation_triangles);
+		*validation_materials = mesh.material_indices;
+		for(uint y = 0; y < args.framebuffer_height; ++y)
+			for(uint x = 0; x < args.framebuffer_width; ++x)
+			{
+				rtm::Ray ray = args.pregen_rays ? rays[y * args.framebuffer_width + x] : args.camera.generate_ray_through_pixel(x, y);
+				rtm::Hit hit(ray.t_max, rtm::vec2(0.0f), ~0u);
+				IntersectStats stats;
+				::intersect(bvh.nodes.data(), bvh.ftbs.data(), ray, hit, stats);
+				auto& reference = (*expected_hits)[ray_key(ray)];
+				reference.hit = hit;
+				++reference.count;
+			}
+		printf("Native reference rays: %zu unique inputs\n", expected_hits->size());
 	}
 
 	args.materials = write_vector(drams, xbar, 256, mesh.materials, heap_address);
@@ -474,6 +557,11 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	UnitL1Cache::PowerConfig l1d_power_config;
 #endif
 
+	rtc_config.node_prefetch_depth = sim_config.get_int("node-prefetch-depth");
+	rtc_config.prefetch_queue_size = sim_config.get_int("prefetch-queue-size");
+	l1d_config.pf_mshr_limit = sim_config.get_int("prefetch-mshr-limit");
+	l2_config.pf_mshr_limit = sim_config.get_int("prefetch-mshr-limit");
+
 	ELF elf(project_folder_path + "src/trax-kernel/riscv/kernel");
 
 	ISA::RISCV::InstructionTypeNameDatabase::get_instance()[ISA::RISCV::InstrType::CUSTOM0] = "FCHTHRD";
@@ -495,6 +583,12 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	std::vector<std::vector<Units::UnitBase*>> unit_tables; unit_tables.reserve(num_tms);
 	std::vector<std::vector<Units::UnitSFU*>> sfu_lists; sfu_lists.reserve(num_tms);
 	std::vector<std::vector<Units::UnitMemoryBase*>> mem_lists; mem_lists.reserve(num_tms);
+
+	const bool audit_hits = sim_config.get_int("validate-hits") || !sim_config.get_string("hit-output").empty();
+	std::vector<std::vector<HitAuditRecord>> hit_records(num_tms);
+	std::map<std::string, HitReference> expected_hits;
+	std::vector<rtm::Triangle> validation_triangles;
+	std::vector<uint> validation_materials;
 
 	//construct memory partitions
 	std::vector<UnitDRAM*> drams;
@@ -527,7 +621,7 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	for(uint addr = 0; addr < heap_address; addr += partition_stride)
 		drams[xbar.get_partition(addr)]->direct_write(vec_mem.data() + addr, partition_stride, xbar.strip_partition_bits(addr));
 
-	TRaXKernelArgs kernel_args = initilize_buffers((Units::UnitMainMemoryBase**)drams.data(), xbar, heap_address, sim_config, partition_stride);
+	TRaXKernelArgs kernel_args = initilize_buffers((Units::UnitMainMemoryBase**)drams.data(), xbar, heap_address, sim_config, partition_stride, sim_config.get_int("validate-hits") ? &expected_hits : nullptr, &validation_triangles, &validation_materials);
 	heap_address = align_to(partition_stride, heap_address);
 
 	for(uint addr = 0; addr < (256 << 20); addr += partition_stride)
@@ -626,6 +720,12 @@ static void run_sim_trax(SimulationConfig& sim_config)
 		rtc_config.cache = l1ds.back();
 		rtc_config.cache_port = num_tps;
 		rtc_config.cache_port_stride = num_tps / l1d_config.num_banks;
+
+		if(audit_hits)
+			rtc_config.hit_observer = [&, tm_index](const rtm::Ray& ray, const rtm::Hit& hit)
+			{
+				hit_records[tm_index].push_back({ray, hit});
+			};
 
 		rtcs.push_back(_new  UnitRTCore(rtc_config));
 		simulator.register_unit(rtcs.back());
@@ -744,6 +844,9 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	delta_log(dram_log, drams);
 	printf("DRAM Read: %.1f GB/s (%.2f%%)\n", (float)dram_log.bytes_read / frame_time_ns, 100.0f * dram_log.bytes_read / frame_cycles / peak_dram_bandwidth);
 	dram_log.print(frame_cycles);
+	printf("DRAM bytes read: %llu\n", (unsigned long long)dram_log.bytes_read);
+	printf("DRAM stores committed: %llu\n", static_cast<unsigned long long>(dram_log.stores));
+	printf("DRAM bytes written: %llu\n", static_cast<unsigned long long>(dram_log.bytes_written));
 
 	print_header("L2$");
 	delta_log(l2_log, l2s);
@@ -770,6 +873,11 @@ static void run_sim_trax(SimulationConfig& sim_config)
 		print_header("RT Core");
 		delta_log(rtc_log, rtcs);
 		rtc_log.print(rtcs.size());
+		printf("RT rays total: %llu\n", (unsigned long long)rtc_log.rays);
+		printf("RT node-fetch ray-cycles total: %llu\n", (unsigned long long)rtc_log.node_fetch_ray_cycles);
+		printf("RT tri-fetch ray-cycles total: %llu\n", (unsigned long long)rtc_log.tri_fetch_ray_cycles);
+		printf("RT prefetch candidates total: %llu\n", (unsigned long long)rtc_log.prefetch_candidates);
+		printf("RT prefetch issued sectors total: %llu\n", (unsigned long long)rtc_log.prefetch_issued_sectors);
 	}
 
 	float total_energy = total_power * frame_time;
@@ -778,8 +886,8 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	printf("Cycles: %lld\n", simulator.current_cycle);
 	printf("Clock rate: %.0f MHz\n", core_clock / 1'000'000.0);
 	printf("Frame time: %.3g ms\n", frame_time * 1000.0);
-	if(!rtcs.empty()) printf("MRays/s: %.0f\n", rtc_log.rays / frame_time / 1'000'000.0);
-	else              printf("MRays/s: %.0f\n", kernel_args.framebuffer_size / frame_time / 1'000'000.0);
+	if(!rtcs.empty()) printf("MRays/s: %.3f\n", rtc_log.rays / frame_time / 1'000'000.0);
+	else              printf("MRays/s: %.3f\n", kernel_args.framebuffer_size / frame_time / 1'000'000.0);
 
 	print_header("Power Summary");
 	printf("Energy: %.2f mJ\n", total_power * frame_time * 1000.0);
@@ -794,6 +902,65 @@ static void run_sim_trax(SimulationConfig& sim_config)
 
 	stbi_flip_vertically_on_write(true);
 	stbi_write_png("out.png", (int)kernel_args.framebuffer_width, (int)kernel_args.framebuffer_height, 4, vec_mem.data() + (size_t)kernel_args.framebuffer, 0);
+
+	if(audit_hits)
+	{
+		std::vector<std::array<uint32_t, 12>> sorted_hits;
+		uint64_t mismatches = 0;
+		uint64_t equivalent_ties = 0;
+		for(const auto& records : hit_records)
+			for(const auto& record : records)
+			{
+				std::array<uint32_t, 12> bits{};
+				static_assert(sizeof(rtm::Ray) == 32 && sizeof(rtm::Hit) == 16);
+				std::memcpy(bits.data(), &record.ray, sizeof(record.ray));
+				std::memcpy(bits.data() + 8, &record.hit, sizeof(record.hit));
+				sorted_hits.push_back(bits);
+				if(sim_config.get_int("validate-hits"))
+				{
+					auto ref = expected_hits.find(ray_key(record.ray));
+					bool match = ref != expected_hits.end();
+					if(match)
+					{
+						const auto& hit = ref->second.hit;
+						match = ref->second.count > 0;
+						if(match) --ref->second.count;
+						const float tolerance = 1e-5f * std::max(1.0f, std::abs(hit.t));
+						const bool exact_primitive = record.hit.id == hit.id && std::abs(record.hit.t - hit.t) <= tolerance &&
+						                             std::abs(record.hit.bc.x - hit.bc.x) <= 1e-5f && std::abs(record.hit.bc.y - hit.bc.y) <= 1e-5f;
+						const bool tie = match && !exact_primitive && equivalent_hit_tie(record, hit, validation_triangles, validation_materials);
+						if(tie) ++equivalent_ties;
+						match = match && (exact_primitive || tie);
+					}
+					if(!match && mismatches++ < 8)
+						fprintf(stderr, "Hit mismatch: actual id=%u t=%.9g, reference id=%u t=%.9g\n", record.hit.id, record.hit.t,
+						        ref == expected_hits.end() ? ~0u : ref->second.hit.id, ref == expected_hits.end() ? 0.0f : ref->second.hit.t);
+				}
+			}
+		std::sort(sorted_hits.begin(), sorted_hits.end());
+		const auto output_path = sim_config.get_string("hit-output");
+		if(!output_path.empty())
+		{
+			std::ofstream output(output_path);
+			if(!output) { fprintf(stderr, "Cannot write hit output: %s\n", output_path.c_str()); std::exit(EXIT_FAILURE); }
+			output << "# ray[8], hit[t,bc.x,bc.y,id]: uint32 hex bit patterns, sorted by ray and hit\n";
+			for(const auto& bits : sorted_hits)
+			{
+				for(uint i = 0; i < bits.size(); ++i)
+					output << (i ? "," : "") << std::hex << std::setw(8) << std::setfill('0') << bits[i];
+				output << '\n';
+			}
+		}
+		if(sim_config.get_int("validate-hits"))
+		{
+			bool complete = sorted_hits.size() == kernel_args.framebuffer_size;
+			for(const auto& reference : expected_hits) complete = complete && reference.second.count == 0;
+			printf("Geometry-confirmed equivalent hits: %llu\n", (unsigned long long)equivalent_ties);
+			printf("Hit validation: %zu/%u rays, %llu mismatches, %s\n", sorted_hits.size(), kernel_args.framebuffer_size,
+			       (unsigned long long)mismatches, complete && mismatches == 0 ? "PASS" : "FAIL");
+			if(!complete || mismatches) std::exit(EXIT_FAILURE);
+		}
+	}
 
 	for(auto& tp : tps) delete tp;
 	for(auto& sfu : sfus) delete sfu;

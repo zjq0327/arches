@@ -25,6 +25,7 @@ public:
 
 		uint num_mshr{1};
 		uint num_subentries{1};
+		uint pf_mshr_limit{8};
 		uint return_queue_size{32};
 		uint latency{1};
 
@@ -77,6 +78,9 @@ protected:
 	struct MSHR //Miss Status Handling Register
 	{
 		std::queue<MemoryRequest> subentries;
+		bool prefetch{false};
+		bool demand_seen{false};
+		bool filled{false};
 		MSHR() = default;
 	};
 
@@ -89,6 +93,9 @@ protected:
 		std::map<paddr_t, MSHR> mshrs;
 
 		std::queue<MemoryRequest> mem_higher_request_queue;
+		std::queue<MemoryRequest> prefetch_request_queue;
+		std::queue<MemoryRequest> prefetch_miss_queue;
+		uint prefetch_mshrs{0};
 		uint mem_higher_port;
 
 		Slice(Configuration config);
@@ -103,6 +110,8 @@ protected:
 	uint _level;
 	uint _num_mshr;
 	uint _num_subentries;
+	uint _pf_mshr_limit;
+	std::set<paddr_t> _prefetched_sectors;
 	bool _block_prefetch;
 	bool _miss_alloc;
 
@@ -114,6 +123,8 @@ protected:
 	void _recive_return();
 	void _recive_request();
 	void _send_request();
+	bool _queue_prefetch(Slice& slice, const MemoryRequest& request);
+	void _allocate_for_fill(paddr_t sector_addr);
 
 	virtual UnitMemoryBase* _get_mem_higher(paddr_t addr) { return _mem_highers[0]; }
 
@@ -121,7 +132,7 @@ public:
 	class Log
 	{
 	public:
-		const static uint NUM_COUNTERS = 10;
+		const static uint NUM_COUNTERS = 20;
 		union
 		{
 			struct
@@ -135,6 +146,17 @@ public:
 				uint64_t tag_array_access;
 				uint64_t data_array_reads;
 				uint64_t data_array_writes;
+				uint64_t pf_received;
+				uint64_t pf_cache_redundant;
+				uint64_t pf_inflight_redundant;
+				uint64_t pf_issued;
+				uint64_t pf_drop;
+				uint64_t pf_fill;
+				uint64_t pf_timely_useful;
+				uint64_t pf_late;
+				uint64_t pf_unused_evicted;
+				uint64_t pf_lookup_hits;
+				uint64_t pf_stalls;
 			};
 			uint64_t counters[NUM_COUNTERS];
 		};
@@ -178,6 +200,17 @@ public:
 			printf("Tag Array Access: %lld\n", tag_array_access / units);
 			printf("Data Array Reads: %lld\n", data_array_reads / units);
 			printf("Data Array Writes: %lld\n", data_array_writes / units);
+			printf("Prefetch Received: %llu\n", static_cast<unsigned long long>(pf_received / units));
+			printf("Prefetch Cache Redundant: %llu\n", static_cast<unsigned long long>(pf_cache_redundant / units));
+			printf("Prefetch Inflight Redundant: %llu\n", static_cast<unsigned long long>(pf_inflight_redundant / units));
+			printf("Prefetch Issued: %llu\n", static_cast<unsigned long long>(pf_issued / units));
+			printf("Prefetch Dropped: %llu\n", static_cast<unsigned long long>(pf_drop / units));
+			printf("Prefetch Filled: %llu\n", static_cast<unsigned long long>(pf_fill / units));
+			printf("Prefetch Timely Useful: %llu\n", static_cast<unsigned long long>(pf_timely_useful / units));
+			printf("Prefetch Late: %llu\n", static_cast<unsigned long long>(pf_late / units));
+			printf("Prefetch Unused Evicted: %llu\n", static_cast<unsigned long long>(pf_unused_evicted / units));
+			printf("Prefetch Lookup Hits: %llu\n", static_cast<unsigned long long>(pf_lookup_hits / units));
+			printf("Prefetch Stalls: %llu\n", static_cast<unsigned long long>(pf_stalls / units));
 		}
 
 		void print_short(cycles_t cycles, uint units = 1)

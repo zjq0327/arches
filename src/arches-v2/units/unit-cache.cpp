@@ -7,7 +7,7 @@ UnitCache::UnitCache(Configuration config) :
 	_request_network(config.num_ports, config.num_slices * config.num_banks, config.block_size, config.crossbar_width),
 	_return_network(config.num_slices * config.num_banks, config.num_ports, config.crossbar_width),
 	_mem_highers(config.mem_highers),
-	_level(config.level), _block_prefetch(config.block_prefetch), _num_mshr(config.num_mshr), _num_subentries(config.num_subentries), _miss_alloc(config.miss_alloc)
+	_level(config.level), _block_prefetch(config.block_prefetch), _num_mshr(config.num_mshr), _num_subentries(config.num_subentries), _pf_mshr_limit(config.pf_mshr_limit), _miss_alloc(config.miss_alloc)
 {
 	_slices.reserve(config.num_slices);
 	for(uint i = 0; i < config.num_slices; ++i)
@@ -35,53 +35,136 @@ UnitCache::~UnitCache()
 
 }
 
+void UnitCache::_allocate_for_fill(paddr_t sector_addr)
+{
+	// A miss-allocated tag may have been evicted before its data returns.
+	// Keep an existing tag, including valid sibling sectors, when it is present.
+	log.tag_array_access++;
+	uint set = _get_set_index(sector_addr);
+	uint64_t tag = _get_tag(sector_addr);
+	for(uint i = set * _associativity; i < (set + 1) * _associativity; ++i)
+		if(_tag_array[i].tag == tag) return;
+
+	Victim victim = _allocate_block(sector_addr);
+	for(uint i = 0; i < _block_size / _sector_size; ++i)
+		if((victim.valid >> i) & 1)
+			if(_prefetched_sectors.erase(victim.addr + i * _sector_size))
+				log.pf_unused_evicted++;
+}
+
+bool UnitCache::_queue_prefetch(Slice& slice, const MemoryRequest& request)
+{
+	const bool hint = request.type == MemoryRequest::Type::PREFECTH;
+	paddr_t sector_addr = _get_sector_addr(request.paddr);
+	// A fill can overtake an earlier lookup while this request waits for the
+	// shared miss-processing opportunity. Charge the recheck and normal hit path.
+	uint8_t* cached_data = _read_sector(sector_addr);
+	log.tag_array_access++;
+	if(cached_data)
+	{
+		if(hint) log.pf_cache_redundant++;
+		else
+		{
+			Bank& bank = slice.banks[_get_bank(sector_addr)];
+			if(!bank.return_queue.is_write_valid()) { log.pf_stalls++; return false; }
+			bank.return_queue.write(MemoryReturn(request, cached_data + _get_sector_offset(request.paddr)));
+			log.data_array_reads++;
+			log.pf_lookup_hits++;
+		}
+		return true;
+	}
+	auto found = slice.mshrs.find(sector_addr);
+	if(found != slice.mshrs.end())
+	{
+		// Hints need no response. Downstream LOADs must return to their cache.
+		if(!hint)
+		{
+			if(found->second.subentries.size() >= _num_subentries) { log.pf_stalls++; return false; }
+			found->second.subentries.push(request);
+		}
+		log.pf_inflight_redundant++;
+		return true;
+	}
+
+	// Preserve a demand slot whenever more than one MSHR exists. A committed
+	// downstream LOAD cannot be dropped; in a one-MSHR cache it must progress.
+	uint reserve = _num_mshr > 1 ? 1 : 0;
+	uint limit = std::min(hint ? _pf_mshr_limit : std::max(1u, _pf_mshr_limit), _num_mshr - reserve);
+	if(hint && _num_mshr <= 1) limit = 0;
+	if(slice.prefetch_mshrs >= limit || slice.mshrs.size() >= _num_mshr - reserve ||
+		slice.prefetch_request_queue.size() >= std::max(1u, _pf_mshr_limit))
+	{
+		if(!hint) { log.pf_stalls++; return false; }
+		log.pf_drop++;
+		return true;
+	}
+
+	MSHR& mshr = slice.mshrs[sector_addr];
+	mshr.prefetch = true;
+	if(!hint) mshr.subentries.push(request);
+	++slice.prefetch_mshrs;
+	MemoryRequest fill;
+	fill.type = MemoryRequest::Type::LOAD;
+	fill.flags.prefetch_origin = 1;
+	fill.paddr = sector_addr;
+	fill.size = _sector_size;
+	fill.port = slice.mem_higher_port;
+	slice.prefetch_request_queue.push(fill);
+	return true;
+}
+
 void UnitCache::_recive_return()
 {
 	for(uint s = 0; s < _slices.size(); ++s)
-	{ 
+	{
 		Slice& slice = _slices[s];
 		for(UnitMemoryBase* mem_higher : _mem_highers)
 		{
-			if(mem_higher->return_port_read_valid(slice.mem_higher_port))
+			if(!mem_higher->return_port_read_valid(slice.mem_higher_port)) continue;
+			MemoryReturn ret = mem_higher->peek_return(slice.mem_higher_port);
+			bool cached = !(ret.flags.omit_cache & (0x1 << _level));
+			if(cached)
 			{
-				MemoryReturn ret = mem_higher->peek_return(slice.mem_higher_port);
-				bool cached = !(ret.flags.omit_cache & (0x1 << _level));
-				if(cached)
+				paddr_t sector_addr = _get_sector_addr(ret.paddr);
+				auto found = slice.mshrs.find(sector_addr);
+				_assert(found != slice.mshrs.end());
+				MSHR& mshr = found->second;
+				Bank& bank = slice.banks[_get_bank(ret.paddr)];
+				if(!mshr.filled)
 				{
-					paddr_t sector_addr = _get_sector_addr(ret.paddr);
-					MSHR& mshr = slice.mshrs[sector_addr];
-					uint b = _get_bank(ret.paddr);
-					Bank& bank = slice.banks[b];
-
-					if(!_miss_alloc) _allocate_block(sector_addr);
-					_write_sector(sector_addr, ret.data, false);
-
-					//fill a subentry and queue for return
-					if(bank.return_pipline.is_write_valid() && !mshr.subentries.empty())
+					_allocate_for_fill(sector_addr);
+					uint8_t* filled_data = _write_sector(sector_addr, ret.data, false);
+					_assert(filled_data);
+					log.data_array_writes++;
+					mshr.filled = true;
+					if(mshr.prefetch)
 					{
-						MemoryRequest& sube_req = mshr.subentries.front();
-						uint sector_offset = _get_sector_offset(sube_req.paddr);
-						bank.return_pipline.write(MemoryReturn(sube_req, ret.data + sector_offset));
-						mshr.subentries.pop();
-					}
-
-					if(mshr.subentries.empty())
-					{
-						mem_higher->read_return(slice.mem_higher_port);
-						slice.mshrs.erase(sector_addr); //free mshr
+						log.pf_fill++;
+						if(!mshr.demand_seen) _prefetched_sectors.insert(sector_addr);
 					}
 				}
-				else
+
+				if(bank.return_pipline.is_write_valid() && !mshr.subentries.empty())
 				{
-					uint b = _get_bank(ret.paddr);
-					Bank& bank = slice.banks[b];
-					if(bank.return_pipline.is_write_valid())
-					{
-						uint i = s * slice.banks.size() + b;
-						ret.port = ret.dst.pop(8);
-						bank.return_pipline.write(ret);
-						mem_higher->read_return(slice.mem_higher_port);
-					}
+					MemoryRequest& sube = mshr.subentries.front();
+					bank.return_pipline.write(MemoryReturn(sube, ret.data + _get_sector_offset(sube.paddr)));
+					mshr.subentries.pop();
+				}
+				if(mshr.subentries.empty())
+				{
+					mem_higher->read_return(slice.mem_higher_port);
+					if(mshr.prefetch) --slice.prefetch_mshrs;
+					slice.mshrs.erase(found);
+				}
+			}
+			else
+			{
+				Bank& bank = slice.banks[_get_bank(ret.paddr)];
+				if(bank.return_pipline.is_write_valid())
+				{
+					ret.port = ret.dst.pop(8);
+					bank.return_pipline.write(ret);
+					mem_higher->read_return(slice.mem_higher_port);
 				}
 			}
 		}
@@ -97,86 +180,125 @@ void UnitCache::_recive_request()
 		{
 			Bank& bank = slice.banks[b];
 			if(!bank.request_pipline.is_read_valid()) continue;
-			if(!bank.return_queue.is_write_valid() || !slice.miss_network.is_write_valid(b))
+			MemoryRequest request = bank.request_pipline.peek();
+			bool hint = request.type == MemoryRequest::Type::PREFECTH;
+			bool pf = hint || request.flags.prefetch_origin;
+			bool cached = !(request.flags.omit_cache & (0x1 << _level));
+			// The no-response hint is consumed only at its L1 target.
+			if(hint && (_level != 1 || !cached))
 			{
-				log.mshr_stalls++;
+				log.pf_received++;
+				log.pf_drop++;
+				bank.request_pipline.read();
+				continue;
+			}
+			if(!hint && (!bank.return_queue.is_write_valid() ||
+				(!pf && !slice.miss_network.is_write_valid(b))))
+			{
+				if(pf) log.pf_stalls++;
+				else log.mshr_stalls++;
 				continue;
 			}
 
-			MemoryRequest request = bank.request_pipline.peek();
 			paddr_t sector_addr = _get_sector_addr(request.paddr);
-			paddr_t sector_offset = _get_sector_offset(request.paddr);
-			uint8_t sector_index = _get_sector_index(request.paddr);
-
-			bool cached = !(request.flags.omit_cache & (0x1 << _level));
 			if(!cached)
 			{
-				//Forward request
 				request.dst.push(request.port, 8);
 				request.port = slice.mem_higher_port;
 				slice.mem_higher_request_queue.push(request);
 				log.uncached_requests++;
 			}
-			else if(request.type == MemoryRequest::Type::LOAD)
+			else if(request.type == MemoryRequest::Type::LOAD || hint)
 			{
-				//check data array
-				uint8_t* sector_data = _read_sector(sector_addr);
+				uint8_t* data = _read_sector(sector_addr);
 				log.tag_array_access++;
-
-				if(sector_data)
+				if(data)
 				{
-					//Hit: fill request and insert into return queue
-					bank.return_queue.write(MemoryReturn(request, sector_data + sector_offset));
-					log.data_array_reads++;
-					log.hits++;
+					if(hint) log.pf_cache_redundant++;
+					else
+					{
+						bank.return_queue.write(MemoryReturn(request, data + _get_sector_offset(request.paddr)));
+						log.data_array_reads++;
+						if(pf) log.pf_lookup_hits++;
+						else
+						{
+							log.hits++;
+							if(_prefetched_sectors.erase(sector_addr)) log.pf_timely_useful++;
+						}
+					}
+				}
+				else if(pf)
+				{
+					if(slice.prefetch_miss_queue.size() >= (hint ? _pf_mshr_limit : std::max(1u, _pf_mshr_limit)))
+					{
+						if(!hint) { log.pf_stalls++; continue; } // A cache-to-cache LOAD needs its response.
+						log.pf_drop++;
+					}
+					else slice.prefetch_miss_queue.push(request);
 				}
 				else
 				{
-					//Miss: allocate a block and insert into miss queue
-					if(_miss_alloc) _allocate_block(sector_addr);
+					if(_miss_alloc) _allocate_for_fill(sector_addr);
 					slice.miss_network.write(request, b);
 				}
 			}
 			else _assert(false);
-
-			//pop the request
+			if(pf) log.pf_received++;
 			bank.request_pipline.read();
 		}
 
-		//Proccess misses
+		// Keep speculative misses out of the demand cascade. Share its one
+		// MSHR allocation opportunity per slice with demand traffic first.
 		slice.miss_network.clock();
-		if(!slice.miss_network.is_read_valid(0)) continue;
+		if(!slice.miss_network.is_read_valid(0))
+		{
+			if(!slice.prefetch_miss_queue.empty() &&
+				_queue_prefetch(slice, slice.prefetch_miss_queue.front()))
+				slice.prefetch_miss_queue.pop();
+			continue;
+		}
 		const MemoryRequest& miss = slice.miss_network.peek(0);
-
-		//Try to fetch an mshr for the line or allocate a new mshr for the line
-		bool request_sector = false;
 		paddr_t sector_addr = _get_sector_addr(miss.paddr);
-		if(slice.mshrs.find(sector_addr) == slice.mshrs.end())
+		uint8_t* cached_data = _read_sector(sector_addr);
+		log.tag_array_access++;
+		if(cached_data)
 		{
-			//Didn't find mshr. Try to allocate one
-			if(slice.mshrs.size() < _num_mshr) 
-				MSHR& mshr = slice.mshrs[sector_addr]; //Allocated a new MSHR
-			else continue; //Out of MSHRs
-			request_sector = true;
-		}
-
-		MSHR& mshr = slice.mshrs[sector_addr];
-		if(mshr.subentries.size() < _num_subentries)
-		{
-			mshr.subentries.push(miss);
+			Bank& bank = slice.banks[_get_bank(sector_addr)];
+			if(!bank.return_queue.is_write_valid()) continue;
+			bank.return_queue.write(MemoryReturn(miss, cached_data + _get_sector_offset(miss.paddr)));
+			log.data_array_reads++;
+			log.hits++;
+			if(_prefetched_sectors.erase(sector_addr)) log.pf_timely_useful++;
 			slice.miss_network.read(0);
-			if(request_sector)
-			{
-				MemoryRequest mshr_fill_req;
-				mshr_fill_req.type = MemoryRequest::Type::LOAD;
-				mshr_fill_req.paddr = sector_addr;
-				mshr_fill_req.size = _sector_size;
-				mshr_fill_req.port = slice.mem_higher_port;
-				slice.mem_higher_request_queue.push(mshr_fill_req);
-				log.misses++;
-			}
-			else log.half_misses++;
+			continue;
 		}
+		bool request_sector = slice.mshrs.find(sector_addr) == slice.mshrs.end();
+		if(request_sector && slice.mshrs.size() >= _num_mshr)
+		{
+			log.mshr_stalls++;
+			continue;
+		}
+		MSHR& mshr = slice.mshrs[sector_addr];
+		if(mshr.subentries.size() >= _num_subentries)
+		{
+			log.mshr_stalls++;
+			continue;
+		}
+		if(mshr.prefetch && !mshr.demand_seen && !mshr.filled) log.pf_late++;
+		mshr.demand_seen = true;
+		mshr.subentries.push(miss);
+		slice.miss_network.read(0);
+		if(request_sector)
+		{
+			MemoryRequest fill;
+			fill.type = MemoryRequest::Type::LOAD;
+			fill.paddr = sector_addr;
+			fill.size = _sector_size;
+			fill.port = slice.mem_higher_port;
+			slice.mem_higher_request_queue.push(fill);
+			log.misses++;
+		}
+		else log.half_misses++;
 
 		if(_block_prefetch)
 		{
@@ -204,16 +326,16 @@ void UnitCache::_send_request()
 	for(uint s = 0; s < _slices.size(); ++s)
 	{
 		Slice& slice = _slices[s];
-		if(slice.mem_higher_request_queue.empty()) continue;
-
-		const MemoryRequest& request = slice.mem_higher_request_queue.front();
+		std::queue<MemoryRequest>* queue = &slice.mem_higher_request_queue;
+		if(queue->empty()) queue = &slice.prefetch_request_queue;
+		if(queue->empty()) continue;
+		const MemoryRequest& request = queue->front();
 		UnitMemoryBase* mem_higher = _get_mem_higher(request.paddr);
-
 		_assert(request.port == slice.mem_higher_port);
 		if(!mem_higher->request_port_write_valid(request.port)) continue;
-
 		mem_higher->write_request(request);
-		slice.mem_higher_request_queue.pop();
+		if(request.flags.prefetch_origin) log.pf_issued++;
+		queue->pop();
 	}
 }
 
