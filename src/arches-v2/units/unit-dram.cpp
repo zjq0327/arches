@@ -127,6 +127,13 @@ bool UnitDRAMRamulator::_store(const MemoryRequest& request, uint channel_index)
 		std::memcpy(&_data_u8[request.paddr], request.data, request.size);
 		log.stores++;
 		log.bytes_written += request.size;
+		if(request.flags.posted_store)
+		{
+			++simulator->posted_stores_committed;
+			uint64_t previous = simulator->outstanding_posted_stores.fetch_sub(1);
+			_assert(previous > 0);
+			(void)previous;
+		}
 	}
 
 	return enqueue_success;

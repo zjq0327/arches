@@ -12,6 +12,23 @@ public:
 	virtual uint get_index() = 0;
 };
 
+// Rotate in the mask's actual width. The 64-bit helper loses wrapped bits
+// when its result is narrowed to a 16-bit or 32-bit arbiter mask.
+template<typename MASK_T>
+inline MASK_T arbiter_rotr(MASK_T mask, uint priority)
+{
+	if constexpr(sizeof(MASK_T) > sizeof(uint64_t))
+		return rotr(mask, priority); // uint128_t has its own full-width overload.
+	else
+	{
+		constexpr uint width = sizeof(MASK_T) * 8;
+		uint n = priority % width;
+		if(n == 0) return mask;
+		uint64_t value = static_cast<uint64_t>(mask);
+		return static_cast<MASK_T>((value >> n) | (value << (width - n)));
+	}
+}
+
 //Uses a nbit integer and BM2 extension to implement a computational and stoarge efficent arbiter for up to 64 clients
 template<typename MASK_T = uint64_t>
 class RoundRobinArbiter : public Arbiter
@@ -55,9 +72,9 @@ public:
 		if(num_pending() == 0)
 			return ~0u;
 
-		MASK_T rot_mask = rotr(_pending, _priority_index); //rotate the mask so the last index flag is in the 0 bit
-		uint offset = ctz(rot_mask); //count the number of 0s till the next 1
-		uint grant_index = (_priority_index + offset) % (sizeof(MASK_T) * 8); //grant the next set bit
+		MASK_T rot_mask = arbiter_rotr(_pending, _priority_index);
+		uint offset = ctz(rot_mask);
+		uint grant_index = (_priority_index + offset) % (sizeof(MASK_T) * 8);
 		_priority_index = grant_index; //make the grant bit the highest priority bit so that it will continue to be granted until removed
 		return grant_index; 
 	}
@@ -115,9 +132,9 @@ public:
 		if(num_pending() == 0)
 			return ~0u;
 
-		MASK_T rot_mask = rotr(_pending, _priority_index); //rotate the mask so the last index flag is in the 0 bit
-		uint offset = ctz(rot_mask); //count the number of 0s till the next 1
-		uint grant_index = (_priority_index + offset) % (sizeof(MASK_T) * 8); //grant the next set bit
+		MASK_T rot_mask = arbiter_rotr(_pending, _priority_index);
+		uint offset = ctz(rot_mask);
+		uint grant_index = (_priority_index + offset) % (sizeof(MASK_T) * 8);
 		if(grant_index != _priority_index) _grant_counter = 0; //if this a new grant chain reset the counter
 		_priority_index = grant_index; //make the grant bit the highest priority bit so that it will continue to be granted until removed
 		return grant_index;

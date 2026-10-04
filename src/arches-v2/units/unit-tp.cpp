@@ -17,6 +17,7 @@ UnitTP::UnitTP(const Configuration& config) :
 	_unique_sfus(*config.unique_sfus), 
 	_cheat_memory(config.cheat_memory),
 	_num_threads(config.num_threads), 
+	_track_posted_stores(config.track_posted_stores),
 	_thread_exec_arbiter(config.num_threads),
 	_thread_data(config.num_threads),
 	_stack_mask(generate_nbit_mask(log2i(config.stack_size))),
@@ -261,6 +262,8 @@ void UnitTP::clock_fall()
 	uint thread_id = _thread_exec_arbiter.get_index();
 	if(thread_id == ~0u) thread_id = _last_thread_id;
 	ThreadData& thread = _thread_data[thread_id];
+	// An empty arbiter may fall back to a halted thread. Never execute its return twice.
+	if(thread.pc == 0) return;
 
 	DecodePhase stall_phase;
 	ISA::RISCV::InstrType stall_type;
@@ -335,7 +338,15 @@ void UnitTP::clock_fall()
 			req.dst.push(thread_id, 4);
 			req.port = _tp_index;
 			if(thread.instr_info.instr_type == ISA::RISCV::InstrType::STORE)
+			{
 				req.flags.omit_cache = 0b1111;
+				if(_track_posted_stores)
+				{
+					req.flags.posted_store = 1;
+					++simulator->outstanding_posted_stores;
+					++simulator->posted_stores_issued;
+				}
+			}
 			_set_dependancies(thread_id);
 
 			UnitMemoryBase* mem = (UnitMemoryBase*)_unit_table[(uint)thread.instr_info.instr_type];

@@ -27,6 +27,7 @@ public:
 		uint num_tps_per_i_cache{1};
 
 		uint num_threads{8};
+		bool track_posted_stores{false}; // Enable only with a backend that commits posted_store requests.
 		uint stack_size{512};
 
 		const std::vector<UnitBase*>* unit_table{nullptr};
@@ -65,6 +66,7 @@ protected:
 
 	uint _last_thread_id;
 	uint _num_threads;
+	bool _track_posted_stores;
 	uint _num_halted_threads;
 	RoundRobinArbiter<uint16_t> _thread_exec_arbiter;
 	std::vector<ThreadData> _thread_data;

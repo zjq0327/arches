@@ -25,6 +25,9 @@ private:
 
 public:
 	std::atomic_uint units_executing{0};
+	std::atomic_uint64_t outstanding_posted_stores{0};
+	std::atomic_uint64_t posted_stores_issued{0};
+	std::atomic_uint64_t posted_stores_committed{0};
 	cycles_t current_cycle{0};
 
 	Simulator() { _unit_groups.emplace_back(0u, 0u); }

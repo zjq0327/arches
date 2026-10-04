@@ -64,7 +64,7 @@ void Simulator::execute(uint delta, std::function<void()> interval_logger)
 			if(delta != 0 && current_cycle % delta == 0)
 				interval_logger();
 		}
-		while(units_executing > 0);
+		while(units_executing > 0 || outstanding_posted_stores > 0);
 
 #ifdef USE_TBB
 	});

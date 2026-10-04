@@ -35,7 +35,8 @@ struct MemoryRequest
 		uint8_t omit_cache : 4;
 		uint8_t trigger_prefetch : 1;
 		uint8_t prefetch_origin : 1;
-		uint8_t : 2;
+		uint8_t posted_store : 1;
+		uint8_t : 1;
 	};
 
 	const static uint MAX_SIZE = CACHE_SECTOR_SIZE;

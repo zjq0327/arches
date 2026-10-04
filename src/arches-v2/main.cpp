@@ -739,6 +739,7 @@ static void run_sim_trax(SimulationConfig& sim_config)
 
 		Units::UnitTP::Configuration tp_config;
 		tp_config.tm_index = tm_index;
+		tp_config.track_posted_stores = true; // This TRaX path commits global STOREs through UnitDRAMRamulator.
 		tp_config.stack_size = stack_size;
 		tp_config.cheat_memory = vec_mem.data();
 		tp_config.unique_mems = &mem_lists.back();
@@ -847,6 +848,9 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	printf("DRAM bytes read: %llu\n", (unsigned long long)dram_log.bytes_read);
 	printf("DRAM stores committed: %llu\n", static_cast<unsigned long long>(dram_log.stores));
 	printf("DRAM bytes written: %llu\n", static_cast<unsigned long long>(dram_log.bytes_written));
+	printf("Posted stores issued: %llu\n", static_cast<unsigned long long>(simulator.posted_stores_issued.load()));
+	printf("Posted stores committed: %llu\n", static_cast<unsigned long long>(simulator.posted_stores_committed.load()));
+	printf("Outstanding posted stores: %llu\n", static_cast<unsigned long long>(simulator.outstanding_posted_stores.load()));
 
 	print_header("L2$");
 	delta_log(l2_log, l2s);
