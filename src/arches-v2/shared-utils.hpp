@@ -220,7 +220,9 @@ public:
 		//Arch
 		set_param("arch-name", "TRaX");
 		set_param("max-rays", 128);
-		set_param("node-prefetch-depth", 0);
+		set_param("stack-trend-prefetch", 0);
+		set_param("ttp-max-distance", 16);
+		set_param("ttp-leaf-prefetch", 0);
 		set_param("prefetch-queue-size", 16);
 		set_param("prefetch-mshr-limit", 8);
 		set_param("validate-hits", 0);
@@ -239,6 +241,11 @@ public:
 		for(uint i = 1; i < argc; ++i)
 		{
 			std::string arg(argv[i]);
+			if(arg == "--node-prefetch-depth")
+			{
+				fprintf(stderr, "Invalid parameter: --node-prefetch-depth\n");
+				std::exit(EXIT_FAILURE);
+			}
 			size_t start_pos = arg.find("--");
 			size_t split_pos = arg.find("=");
 			if(start_pos == std::string::npos || split_pos == std::string::npos) continue;
@@ -252,10 +259,19 @@ public:
 			parse_param(key, value);
 		}
 
-		if(get_int("node-prefetch-depth") < 0 || get_int("node-prefetch-depth") > 2 ||
-		   get_int("prefetch-queue-size") < 2 || get_int("prefetch-mshr-limit") < 0)
+		if(get_int("prefetch-queue-size") < 2 || get_int("prefetch-mshr-limit") < 0)
 		{
-			fprintf(stderr, "Invalid prefetch configuration: depth must be 0..2, queue >= 2, MSHR limit >= 0\n");
+			fprintf(stderr, "Invalid prefetch configuration: queue >= 2, MSHR limit >= 0\n");
+			std::exit(EXIT_FAILURE);
+		}
+
+		if(get_int("stack-trend-prefetch") < 0 || get_int("stack-trend-prefetch") > 1 ||
+		   get_int("ttp-leaf-prefetch") < 0 || get_int("ttp-leaf-prefetch") > 1 ||
+		   get_int("ttp-max-distance") < 2 || get_int("ttp-max-distance") > 32 ||
+		   (get_int("ttp-leaf-prefetch") && !get_int("stack-trend-prefetch")) ||
+		   (get_int("ttp-leaf-prefetch") && get_int("prefetch-queue-size") < 4))
+		{
+			fprintf(stderr, "Invalid TTP configuration: flags must be 0/1, distance 2..32, leaves require TTP and queue >= 4\n");
 			std::exit(EXIT_FAILURE);
 		}
 
@@ -346,7 +362,8 @@ public:
 		}
 		else
 		{
-			printf("Invalid Parameter!!!: %s\n", key.c_str());
+			fprintf(stderr, "Invalid parameter: --%s\n", key.c_str());
+			std::exit(EXIT_FAILURE);
 		}
 	}
 

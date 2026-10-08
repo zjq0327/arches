@@ -557,7 +557,9 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	UnitL1Cache::PowerConfig l1d_power_config;
 #endif
 
-	rtc_config.node_prefetch_depth = sim_config.get_int("node-prefetch-depth");
+	rtc_config.stack_trend_prefetch = sim_config.get_int("stack-trend-prefetch");
+	rtc_config.ttp_max_distance = sim_config.get_int("ttp-max-distance");
+	rtc_config.ttp_leaf_prefetch = sim_config.get_int("ttp-leaf-prefetch");
 	rtc_config.prefetch_queue_size = sim_config.get_int("prefetch-queue-size");
 	l1d_config.pf_mshr_limit = sim_config.get_int("prefetch-mshr-limit");
 	l2_config.pf_mshr_limit = sim_config.get_int("prefetch-mshr-limit");

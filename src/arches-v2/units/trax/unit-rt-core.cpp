@@ -14,10 +14,12 @@ UnitRTCore<NT, PT>::UnitRTCore(const Configuration& config) :
 	_max_rays(config.max_rays), _node_base_addr(config.node_base_addr), _tri_base_addr(config.tri_base_addr), _vrt_base_addr(config.vrt_base_addr),
 	_cache(config.cache), _request_network(config.num_clients, 1), _return_network(1, config.num_clients),
 	_box_pipline(12), _tri_pipline(22), _cache_port(config.cache_port), _cache_port_stride(config.cache_port_stride),
-	_node_prefetch_depth(config.node_prefetch_depth), _prefetch_queue_size(config.prefetch_queue_size),
+	_stack_trend_prefetch(config.stack_trend_prefetch),
+	_ttp_max_distance(config.ttp_max_distance), _ttp_leaf_prefetch(config.ttp_leaf_prefetch),
+	_prefetch_queue_size(config.prefetch_queue_size),
 	_hit_observer(config.hit_observer)
 {
-	_assert(_node_prefetch_depth <= 2);
+	_assert(_ttp_max_distance >= 2 && _ttp_max_distance <= RayState::STACK_SIZE);
 	_ray_states.resize(config.max_rays);
 	for(uint i = 0; i < _ray_states.size(); ++i)
 	{
@@ -55,7 +57,7 @@ template<typename NT, typename PT>
 void UnitRTCore<NT, PT>::clock_fall()
 {
 	// The additional read-only stack port reads at most one candidate per global cycle.
-	_scan_node_prefetch_candidate();
+	if(_stack_trend_prefetch) _scan_stack_trend_candidate();
 	_issue_requests();
 	_issue_returns();
 	_return_network.clock();
@@ -124,18 +126,6 @@ bool UnitRTCore<NT, PT>::_try_queue_tri(uint ray_id, uint tri_id)
 		addr += req.size;
 	}
 
-	auto& last_req = _cache_fetch_queues[ray_id % _cache_fetch_queues.size()].back();
-	//last_req.flags.trigger_prefetch = 1;
-	//for(uint32_t i = 0; i < 8; ++i)
-	//{
-	//	last_req.prefetch_offsets[0] = 0;
-	//	if(i < ray_state.stack_size)
-	//	{
-	//		paddr_t addr = ray_state.stack[ray_state.stack_size - i - 1];
-	//		if(addr / 4096 == start / 4096) last_req.prefetch_offsets[0] = (start % 4096) / 32;
-	//	}
-	//}
-
 	return true;
 }
 
@@ -154,7 +144,7 @@ bool UnitRTCore<NT, PT>::_try_queue_prefetch(uint ray_id, paddr_t addr, uint siz
 	// A node is admitted as a whole, so a full 64-byte node needs two queue slots.
 	if(missing_sectors.size() > _prefetch_queue_size - _prefetch_queue.size())
 	{
-		log.prefetch_dropped_sectors += missing_sectors.size();
+		// TTP retains the candidate for retry without advancing its cursor.
 		return false;
 	}
 
@@ -169,14 +159,11 @@ bool UnitRTCore<NT, PT>::_try_queue_prefetch(uint ray_id, paddr_t addr, uint siz
 }
 
 template<typename NT, typename PT>
-void UnitRTCore<NT, PT>::_invalidate_node_prefetch(uint ray_id)
+void UnitRTCore<NT, PT>::_invalidate_prefetch(uint ray_id)
 {
-	if(_node_prefetch_depth == 0) return;
+	if(!_prefetch_enabled()) return;
 	RayState& ray_state = _ray_states[ray_id];
 	++ray_state.prefetch_epoch;
-	ray_state.prefetch_scan_next = 0;
-	ray_state.prefetch_scan_count = 0;
-	ray_state.prefetch_first_valid = false;
 
 	for(auto it = _prefetch_queue.begin(); it != _prefetch_queue.end();)
 	{
@@ -192,81 +179,127 @@ void UnitRTCore<NT, PT>::_invalidate_node_prefetch(uint ray_id)
 }
 
 template<typename NT, typename PT>
-void UnitRTCore<NT, PT>::_begin_node_prefetch_scan(uint ray_id)
+void UnitRTCore<NT, PT>::_reset_stack_trend_prefetch(uint ray_id)
 {
-	if(_node_prefetch_depth == 0) return;
 	RayState& ray_state = _ray_states[ray_id];
-	ray_state.prefetch_scan_stack_size = ray_state.stack_size;
-	ray_state.prefetch_scan_next = 0;
-	ray_state.prefetch_scan_count = static_cast<uint8_t>(
-		std::min(_node_prefetch_depth, static_cast<uint>(ray_state.stack_size)));
-	ray_state.prefetch_first_valid = false;
-	if(ray_state.prefetch_scan_count && !_prefetch_stack_read_used)
+	_invalidate_prefetch(ray_id);
+	ray_state.ttp_snapshot_valid = false;
+	ray_state.ttp_state = 0;
+	ray_state.ttp_cursor = static_cast<int16_t>(ray_state.stack_size) - 1;
+	ray_state.ttp_floor = ray_state.stack_size;
+	ray_state.ttp_pending_push = false;
+	ray_state.ttp_pending_trim = false;
+	++log.ttp_resets;
+}
+
+template<typename NT, typename PT>
+void UnitRTCore<NT, PT>::_queue_stack_trend_scan(uint ray_id)
+{
+	RayState& ray_state = _ray_states[ray_id];
+	bool& queued = ray_state.ttp_scan_queued;
+	if(ray_state.ttp_cursor >= ray_state.ttp_floor && !queued)
 	{
-		// Capture the top entry at the pop, before any later node intersection can push.
-		ray_state.prefetch_first_snapshot = ray_state.stack[ray_state.stack_size - 1];
-		ray_state.prefetch_first_valid = true;
-		_prefetch_stack_read_used = true;
-	}
-	if(ray_state.prefetch_scan_count && !ray_state.prefetch_scan_queued)
-	{
-		_prefetch_scan_queue.push(ray_id);
-		ray_state.prefetch_scan_queued = true;
+		_ttp_scan_queue.push(ray_id);
+		queued = true;
 	}
 }
 
 template<typename NT, typename PT>
-void UnitRTCore<NT, PT>::_scan_node_prefetch_candidate()
+void UnitRTCore<NT, PT>::_stack_trend_pop(uint ray_id)
 {
-	if(_node_prefetch_depth == 0) return;
-	// A ready pop-time snapshot may be behind a scan waiting for the next cycle's port.
-	const uint pending = static_cast<uint>(_prefetch_scan_queue.size());
+	RayState& ray_state = _ray_states[ray_id];
+	ray_state.ttp_state = static_cast<uint8_t>(std::min(3u, static_cast<uint>(ray_state.ttp_state) + 1));
+	++log.ttp_pop_states[ray_state.ttp_state - 1];
+	const uint distance = ray_state.ttp_state < 3 ? ray_state.ttp_state : _ttp_max_distance;
+	ray_state.ttp_floor = static_cast<int16_t>(std::max(0, static_cast<int>(ray_state.stack_size) - static_cast<int>(distance)));
+	const int16_t top = static_cast<int16_t>(ray_state.stack_size) - 1;
+	if(ray_state.ttp_cursor > top)
+	{
+		// A pending candidate that has become this pop's demand is no longer speculative.
+		ray_state.ttp_cursor = top;
+		ray_state.ttp_snapshot_valid = false;
+	}
+	_queue_stack_trend_scan(ray_id);
+}
+
+template<typename NT, typename PT>
+bool UnitRTCore<NT, PT>::_scan_stack_trend_candidate()
+{
+	std::queue<uint>& scan_queue = _ttp_scan_queue;
+	const uint pending = static_cast<uint>(scan_queue.size());
 	for(uint scanned = 0; scanned < pending; ++scanned)
 	{
-		const uint ray_id = _prefetch_scan_queue.front();
-		_prefetch_scan_queue.pop();
+		const uint ray_id = scan_queue.front();
+		scan_queue.pop();
 		RayState& ray_state = _ray_states[ray_id];
-		ray_state.prefetch_scan_queued = false;
-		if(ray_state.prefetch_scan_next >= ray_state.prefetch_scan_count) continue;
-		if(ray_state.stack_size != ray_state.prefetch_scan_stack_size)
+		ray_state.ttp_scan_queued = false;
+		if(ray_state.phase == RayState::Phase::RAY_FETCH || ray_state.phase == RayState::Phase::HIT_RETURN) continue;
+		// The simulator computes intersection results before their latency FIFO retires.
+		// Do not observe its early stack or hit writes while either pipeline is active.
+		if(ray_state.phase == RayState::Phase::NODE_ISECT || ray_state.phase == RayState::Phase::TRI_ISECT)
 		{
-			_invalidate_node_prefetch(ray_id);
+			_queue_stack_trend_scan(ray_id);
 			continue;
 		}
+		if(ray_state.ttp_cursor < ray_state.ttp_floor) continue;
+		_assert(ray_state.ttp_cursor >= 0 && ray_state.ttp_cursor < ray_state.stack_size);
 
-		StackEntry entry;
-		if(ray_state.prefetch_scan_next == 0 && ray_state.prefetch_first_valid)
-		{
-			entry = ray_state.prefetch_first_snapshot;
-			ray_state.prefetch_first_valid = false;
-		}
+		bool& snapshot_valid = ray_state.ttp_snapshot_valid;
+		StackEntry& snapshot = ray_state.ttp_snapshot;
+		const bool retry = snapshot_valid;
+		if(retry) ++log.ttp_queue_retries;
 		else
 		{
 			if(_prefetch_stack_read_used)
 			{
-				_prefetch_scan_queue.push(ray_id);
-				ray_state.prefetch_scan_queued = true;
+				_queue_stack_trend_scan(ray_id);
 				continue;
 			}
-			const uint slot = ray_state.prefetch_scan_stack_size - 1 - ray_state.prefetch_scan_next;
-			entry = ray_state.stack[slot];
+			snapshot = ray_state.stack[ray_state.ttp_cursor];
+			snapshot_valid = true;
 			_prefetch_stack_read_used = true;
-		}
-		++ray_state.prefetch_scan_next;
-		if(ray_state.prefetch_scan_next < ray_state.prefetch_scan_count)
-		{
-			_prefetch_scan_queue.push(ray_id);
-			ray_state.prefetch_scan_queued = true;
+			++log.ttp_scan_reads;
 		}
 
-		if(entry.data.is_int && entry.t < ray_state.hit.t)
+		const StackEntry& entry = snapshot;
+		bool advance = true;
+		if(!entry.data.is_int && !_ttp_leaf_prefetch) ++log.ttp_filtered_type;
+		else if(!(entry.t < ray_state.hit.t)) ++log.ttp_filtered_hit;
+		else
 		{
-			log.prefetch_candidates++;
-			const paddr_t addr = _node_base_addr + entry.data.child_idx * sizeof(NT);
-			_try_queue_prefetch(ray_id, addr, sizeof(NT), 0);
+			if(!retry)
+			{
+				++log.prefetch_candidates;
+				if(entry.data.is_int) ++log.ttp_node_candidates;
+				else ++log.ttp_leaf_candidates;
+			}
+			paddr_t addr;
+			uint size;
+			if(entry.data.is_int)
+			{
+				addr = _node_base_addr + entry.data.child_idx * sizeof(NT);
+				size = sizeof(NT);
+			}
+			else
+			{
+				// A leaf entry can describe multiple FTBs; fetch only its next block.
+				addr = _tri_base_addr + entry.data.prim_idx * sizeof(PT);
+				if(typeid(NT) == typeid(rtm::HECWBVH::Node))
+					addr = _node_base_addr + entry.data.prim_idx * sizeof(NT);
+				size = sizeof(PT);
+			}
+			advance = _try_queue_prefetch(ray_id, addr, size, 0);
+			if(!advance) ++log.ttp_queue_full;
 		}
-		return; // At most one candidate is processed per global cycle.
+		if(advance)
+		{
+			--ray_state.ttp_cursor;
+			snapshot_valid = false;
+		}
+		_queue_stack_trend_scan(ray_id);
+		return true; // A retry or filtered entry also consumes this cycle's candidate opportunity.
 	}
+	return false;
 }
 
 template<typename NT, typename PT>
@@ -284,7 +317,6 @@ void UnitRTCore<NT, PT>::_read_requests()
 		_free_ray_ids.erase(ray_id);
 
 		RayState& ray_state = _ray_states[ray_id];
-		_invalidate_node_prefetch(ray_id);
 		std::memcpy(&ray_state.ray, request.data, sizeof(rtm::Ray));
 		ray_state.inv_d = rtm::vec3(1.0f) / ray_state.ray.d;
 		ray_state.hit.t = ray_state.ray.t_max;
@@ -302,6 +334,11 @@ void UnitRTCore<NT, PT>::_read_requests()
 		ray_state.dst = request.dst;
 		ray_state.dst.push(request.port, 8);
 		ray_state.phase = RayState::Phase::SCHEDULER;
+		if(_stack_trend_prefetch)
+		{
+			_reset_stack_trend_prefetch(ray_id);
+			++log.ttp_reuse_resets;
+		}
 		_ray_scheduling_queue.push(ray_id);
 
 		log.rays++;
@@ -367,9 +404,9 @@ void UnitRTCore<NT, PT>::_schedule_ray()
 		_ray_scheduling_queue.pop();
 
 		RayState& ray_state = _ray_states[ray_id];
-		_invalidate_node_prefetch(ray_id);
 
 		StackEntry entry;
+		bool actual_pop = true;
 		if(ray_state.update_restart_trail)
 		{
 			uint parent_level = ray_state.restart_trail.find_parent_level(ray_state.level);
@@ -378,6 +415,11 @@ void UnitRTCore<NT, PT>::_schedule_ray()
 				//Ray complete
 				//stack empty or anyhit found return the hit
 				ray_state.phase = RayState::Phase::HIT_RETURN;
+				if(_stack_trend_prefetch)
+				{
+					_reset_stack_trend_prefetch(ray_id);
+					++log.ttp_complete_resets;
+				}
 				_ray_return_queue.push(ray_id);
 
 				log.issue_counters[(uint)IssueType::HIT_RETURN]++;
@@ -397,6 +439,12 @@ void UnitRTCore<NT, PT>::_schedule_ray()
 				entry.data.is_int = 1;
 				entry.data.child_idx = 0;
 				ray_state.level = 0;
+				actual_pop = false;
+				if(_stack_trend_prefetch)
+				{
+					_reset_stack_trend_prefetch(ray_id);
+					++log.ttp_restart_resets;
+				}
 				log.restarts++;
 			}
 			else
@@ -414,6 +462,7 @@ void UnitRTCore<NT, PT>::_schedule_ray()
 		}
 
 		ray_state.update_restart_trail = true;
+		if(_stack_trend_prefetch && actual_pop) _stack_trend_pop(ray_id);
 
 		if(!_pop_culling || entry.t < ray_state.hit.t)
 		{
@@ -421,7 +470,6 @@ void UnitRTCore<NT, PT>::_schedule_ray()
 			{
 				_try_queue_node(ray_id, entry.data.child_idx);
 				ray_state.phase = RayState::Phase::NODE_FETCH;
-				_begin_node_prefetch_scan(ray_id);
 
 				log.issue_counters[(uint)IssueType::NODE_FETCH]++;
 				if(ENABLE_RT_DEBUG_PRINTS)
@@ -436,10 +484,15 @@ void UnitRTCore<NT, PT>::_schedule_ray()
 					entry.data.prim_idx++;
 					ray_state.stack[ray_state.stack_size++] = entry;
 					ray_state.update_restart_trail = false;
+					if(_stack_trend_prefetch)
+					{
+						_reset_stack_trend_prefetch(ray_id);
+						++log.ttp_push_resets;
+						++log.ttp_leaf_continuation_resets;
+					}
 				}
 
 				ray_state.phase = RayState::Phase::TRI_FETCH;
-				_begin_node_prefetch_scan(ray_id);
 
 				log.issue_counters[(uint)IssueType::TRI_FETCH]++;
 				if(ENABLE_RT_DEBUG_PRINTS)
@@ -532,12 +585,13 @@ void UnitRTCore<NT, PT>::_simualte_node_pipline()
 
 				if(ray_state.stack_size > RayState::STACK_SIZE)
 				{
+					if(_stack_trend_prefetch) ray_state.ttp_pending_trim = true;
 					uint drain_count = ray_state.stack_size - RayState::STACK_SIZE;
 					for(uint i = 0; i < RayState::STACK_SIZE; ++i)
 						ray_state.stack[i] = ray_state.stack[i + drain_count];
 					ray_state.stack_size = RayState::STACK_SIZE;
 				}
-				_invalidate_node_prefetch(ray_id);
+				if(_stack_trend_prefetch) ray_state.ttp_pending_push = true;
 			}
 
 			_box_pipline.write(ray_id);
@@ -557,7 +611,15 @@ void UnitRTCore<NT, PT>::_simualte_node_pipline()
 		uint ray_id = _box_pipline.read();
 		if(ray_id != ~0u)
 		{
-			_ray_states[ray_id].phase = RayState::Phase::SCHEDULER;
+			RayState& ray_state = _ray_states[ray_id];
+			if(_stack_trend_prefetch && ray_state.ttp_pending_push)
+			{
+				const bool trimmed = ray_state.ttp_pending_trim;
+				_reset_stack_trend_prefetch(ray_id);
+				++log.ttp_push_resets;
+				if(trimmed) ++log.ttp_trim_resets;
+			}
+			ray_state.phase = RayState::Phase::SCHEDULER;
 			_ray_scheduling_queue.push(ray_id);
 			log.nodes++;
 		}
@@ -583,12 +645,10 @@ void UnitRTCore<NT, PT>::_simualte_tri_pipline()
 			rtm::Ray& ray = ray_state.ray;
 			rtm::vec3& inv_d = ray_state.inv_d;
 			rtm::Hit& hit = ray_state.hit;
-			const float previous_hit_t = hit.t;
 
 			for(uint i = 0; i < tri_count; ++i)
 				if(rtm::intersect(tris[i].tri, ray, hit))
 					hit.id = tris[i].id;
-			if(hit.t < previous_hit_t) _invalidate_node_prefetch(ray_id);
 
 			_tri_pipline.write(ray_id);
 			_tri_isect_queue.pop();
@@ -609,7 +669,8 @@ void UnitRTCore<NT, PT>::_simualte_tri_pipline()
 		uint ray_id = _tri_pipline.read();
 		if(ray_id != ~0u)
 		{
-			_ray_states[ray_id].phase = RayState::Phase::SCHEDULER;
+			RayState& ray_state = _ray_states[ray_id];
+			ray_state.phase = RayState::Phase::SCHEDULER;
 			_ray_scheduling_queue.push(ray_id);
 		}
 
@@ -620,7 +681,7 @@ template<typename NT, typename PT>
 void UnitRTCore<NT, PT>::_issue_requests()
 {
 	std::vector<uint8_t> demand_selected;
-	if(_node_prefetch_depth) demand_selected.resize(_cache_fetch_queues.size(), 0);
+	if(_prefetch_enabled()) demand_selected.resize(_cache_fetch_queues.size(), 0);
 	for(uint i = 0; i < _cache_fetch_queues.size(); ++i)
 	{
 		uint port = _cache_port + i * _cache_port_stride;
@@ -629,12 +690,12 @@ void UnitRTCore<NT, PT>::_issue_requests()
 			_cache_fetch_queues[i].front().port = port;
 			_cache->write_request(_cache_fetch_queues[i].front());
 			_cache_fetch_queues[i].pop();
-			if(_node_prefetch_depth) demand_selected[i] = 1;
+			if(_prefetch_enabled()) demand_selected[i] = 1;
 		}
 	}
 
 	// Demand has selected all ports before any prefetch is considered.
-	if(_node_prefetch_depth == 0 || _prefetch_queue.empty()) return;
+	if(!_prefetch_enabled() || _prefetch_queue.empty()) return;
 	while(!_prefetch_queue.empty())
 	{
 		const PrefetchItem& item = _prefetch_queue.front();
@@ -688,7 +749,6 @@ void UnitRTCore<NT, PT>::_issue_returns()
 			std::memcpy(ret.data, &ray_state.hit, sizeof(rtm::Hit));
 			_return_network.write(ret, 0);
 			if(_hit_observer) _hit_observer(ray_state.ray, ray_state.hit);
-			_invalidate_node_prefetch(ray_id);
 
 			ray_state.phase = RayState::Phase::RAY_FETCH;
 			_free_ray_ids.insert(ray_id);

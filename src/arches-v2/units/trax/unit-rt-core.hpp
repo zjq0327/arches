@@ -23,7 +23,9 @@ public:
 		uint cache_port{0};
 		uint num_cache_ports{1};
 		uint cache_port_stride{1};
-		uint node_prefetch_depth{0};
+		bool stack_trend_prefetch{false};
+		uint ttp_max_distance{16};
+		bool ttp_leaf_prefetch{false};
 		uint prefetch_queue_size{16}; // 32-byte sectors
 		std::function<void(const rtm::Ray&, const rtm::Hit&)> hit_observer{};
 	};
@@ -98,14 +100,18 @@ private:
 
 		bool done;
 
-		// One scan reads only the stack visible immediately after its pop.
 		uint64_t prefetch_epoch{0};
-		uint8_t prefetch_scan_stack_size{0};
-		uint8_t prefetch_scan_next{0};
-		uint8_t prefetch_scan_count{0};
-		bool prefetch_scan_queued{false};
-		bool prefetch_first_valid{false};
-		StackEntry prefetch_first_snapshot;
+
+		// TTP keeps its position across pops; pushes reset the scan window.
+		uint8_t ttp_state{0};
+		int16_t ttp_cursor{-1};
+		int16_t ttp_floor{0};
+		bool ttp_pending_push{false};
+		bool ttp_pending_trim{false};
+
+		StackEntry ttp_snapshot;
+		bool ttp_snapshot_valid{false};
+		bool ttp_scan_queued{false};
 
 		RayState() {};
 	};
@@ -134,10 +140,12 @@ private:
 
 	std::vector<std::queue<MemoryRequest>> _cache_fetch_queues;
 	// One additional read-only stack port serves at most one candidate per global cycle.
-	std::queue<uint> _prefetch_scan_queue;
+	std::queue<uint> _ttp_scan_queue;
 	std::deque<PrefetchItem> _prefetch_queue;
 	std::set<paddr_t> _queued_prefetch_sectors;
-	uint _node_prefetch_depth;
+	bool _stack_trend_prefetch;
+	uint _ttp_max_distance;
+	bool _ttp_leaf_prefetch;
 	uint _prefetch_queue_size;
 	uint _next_prefetch_cache_port{0};
 	bool _prefetch_stack_read_used{false};
@@ -216,9 +224,12 @@ private:
 	bool _try_queue_tri(uint ray_id, uint tri_id);
 	bool _try_queue_vrts(uint ray_id);
 	bool _try_queue_prefetch(uint ray_id, paddr_t addr, uint size, uint cache_mask);
-	void _invalidate_node_prefetch(uint ray_id);
-	void _begin_node_prefetch_scan(uint ray_id);
-	void _scan_node_prefetch_candidate();
+	bool _prefetch_enabled() const { return _stack_trend_prefetch; }
+	void _invalidate_prefetch(uint ray_id);
+	void _reset_stack_trend_prefetch(uint ray_id);
+	void _stack_trend_pop(uint ray_id);
+	void _queue_stack_trend_scan(uint ray_id);
+	bool _scan_stack_trend_candidate();
 
 	void _read_requests();
 	void _read_returns();
@@ -233,7 +244,8 @@ public:
 	class Log
 	{
 	private:
-		constexpr static uint NUM_COUNTERS = 32;
+		constexpr static uint NUM_COUNTERS = 6 + (uint)IssueType::NUM_TYPES +
+			(uint)RayState::Phase::NUM_PHASES + 6 + 17;
 
 	public:
 		union
@@ -254,6 +266,21 @@ public:
 				uint64_t prefetch_issued_sectors;
 				uint64_t node_fetch_ray_cycles;
 				uint64_t tri_fetch_ray_cycles;
+				uint64_t ttp_pop_states[3];
+				uint64_t ttp_resets;
+				uint64_t ttp_push_resets;
+				uint64_t ttp_leaf_continuation_resets;
+				uint64_t ttp_restart_resets;
+				uint64_t ttp_trim_resets;
+				uint64_t ttp_reuse_resets;
+				uint64_t ttp_complete_resets;
+				uint64_t ttp_scan_reads;
+				uint64_t ttp_queue_retries;
+				uint64_t ttp_queue_full;
+				uint64_t ttp_filtered_type;
+				uint64_t ttp_filtered_hit;
+				uint64_t ttp_node_candidates;
+				uint64_t ttp_leaf_candidates;
 			};
 			uint64_t counters[NUM_COUNTERS];
 		};
@@ -312,6 +339,25 @@ public:
 			printf("Prefetch Queued Sectors: %llu\n", static_cast<unsigned long long>(prefetch_queued_sectors / num_units));
 			printf("Prefetch Dropped Sectors: %llu\n", static_cast<unsigned long long>(prefetch_dropped_sectors / num_units));
 			printf("Prefetch Issued Sectors: %llu\n", static_cast<unsigned long long>(prefetch_issued_sectors / num_units));
+			if(ttp_resets || ttp_pop_states[0] || ttp_pop_states[1] || ttp_pop_states[2])
+			{
+				for(uint i = 0; i < 3; ++i)
+					printf("TTP Pop S%u Total: %llu\n", i + 1, static_cast<unsigned long long>(ttp_pop_states[i]));
+				printf("TTP Resets Total: %llu\n", static_cast<unsigned long long>(ttp_resets));
+				printf("TTP Push Resets Total: %llu\n", static_cast<unsigned long long>(ttp_push_resets));
+				printf("TTP Leaf Continuation Resets Total: %llu\n", static_cast<unsigned long long>(ttp_leaf_continuation_resets));
+				printf("TTP Restart Resets Total: %llu\n", static_cast<unsigned long long>(ttp_restart_resets));
+				printf("TTP Trim Resets Total: %llu\n", static_cast<unsigned long long>(ttp_trim_resets));
+				printf("TTP Reuse Resets Total: %llu\n", static_cast<unsigned long long>(ttp_reuse_resets));
+				printf("TTP Complete Resets Total: %llu\n", static_cast<unsigned long long>(ttp_complete_resets));
+				printf("TTP Scan Reads Total: %llu\n", static_cast<unsigned long long>(ttp_scan_reads));
+				printf("TTP Queue Retries Total: %llu\n", static_cast<unsigned long long>(ttp_queue_retries));
+				printf("TTP Queue Full Total: %llu\n", static_cast<unsigned long long>(ttp_queue_full));
+				printf("TTP Filtered Type Total: %llu\n", static_cast<unsigned long long>(ttp_filtered_type));
+				printf("TTP Filtered Hit Total: %llu\n", static_cast<unsigned long long>(ttp_filtered_hit));
+				printf("TTP Node Candidates Total: %llu\n", static_cast<unsigned long long>(ttp_node_candidates));
+				printf("TTP Leaf Candidates Total: %llu\n", static_cast<unsigned long long>(ttp_leaf_candidates));
+			}
 
 			uint64_t issue_total = 0;
 			std::vector<std::pair<const char*, uint64_t>> _issue_counter_pairs;
