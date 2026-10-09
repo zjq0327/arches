@@ -227,6 +227,12 @@ public:
 		set_param("prefetch-mshr-limit", 8);
 		set_param("validate-hits", 0);
 		set_param("hit-output", "");
+		set_param("ray-input", "");
+		set_param("ray-output", "");
+		set_param("id-hit-output", "");
+		set_param("ftb-wait-diagnostics", 0); // Host-only event trace; no modeled hardware cost.
+		set_param("ftb-memory-diagnostics", 0); // Host-only cross-cache request/fill lineage.
+		set_param("ftb-wait-output", "ftb-wait"); // Prefix for .ftb.csv and .rays.csv.
 
 		//Workload
 		set_param("dataset-dir", "./datasets");
@@ -241,11 +247,6 @@ public:
 		for(uint i = 1; i < argc; ++i)
 		{
 			std::string arg(argv[i]);
-			if(arg == "--node-prefetch-depth")
-			{
-				fprintf(stderr, "Invalid parameter: --node-prefetch-depth\n");
-				std::exit(EXIT_FAILURE);
-			}
 			size_t start_pos = arg.find("--");
 			size_t split_pos = arg.find("=");
 			if(start_pos == std::string::npos || split_pos == std::string::npos) continue;
@@ -281,6 +282,29 @@ public:
 			std::exit(EXIT_FAILURE);
 		}
 
+		if((!get_string("ray-input").empty() || !get_string("ray-output").empty()) && !get_int("pregen-rays"))
+		{
+			fprintf(stderr, "ray-input/ray-output require pregen-rays=1\n");
+			std::exit(EXIT_FAILURE);
+		}
+		if(get_int("ftb-wait-diagnostics") < 0 || get_int("ftb-wait-diagnostics") > 1 ||
+		   (get_int("ftb-wait-diagnostics") && (get_string("arch-name") != "TRaX" ||
+		      !get_int("pregen-rays") || get_string("ftb-wait-output").empty())))
+		{
+			fprintf(stderr, "FTB wait diagnostics must be 0/1; enabled requires TRaX HE2/FTB, pregen-rays=1 and nonempty ftb-wait-output\n");
+			std::exit(EXIT_FAILURE);
+		}
+		if(get_int("ftb-memory-diagnostics") < 0 || get_int("ftb-memory-diagnostics") > 1 ||
+			(get_int("ftb-memory-diagnostics") && !get_int("ftb-wait-diagnostics")))
+		{
+			fprintf(stderr, "FTB memory diagnostics must be 0/1 and require ftb-wait-diagnostics=1\n");
+			std::exit(EXIT_FAILURE);
+		}
+		if(!get_string("id-hit-output").empty() && !get_int("pregen-rays"))
+		{
+			fprintf(stderr, "id-hit-output requires pregen-rays=1\n");
+			std::exit(EXIT_FAILURE);
+		}
 		set_param("arch-id", -1);
 		for(int i = 0; i < arch_names.size(); ++i)
 			if(get_string("arch-name").compare(arch_names[i]) == 0)

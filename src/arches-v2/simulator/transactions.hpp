@@ -47,6 +47,8 @@ struct MemoryRequest
 	Flags flags{};
 	uint16_t port{0};
 	BitStack58 dst{};
+	// Host-only FTB memory observation; never part of payload, routing or modeled bandwidth.
+	uint64_t host_trace_token{0}, host_trace_entry_cycle{0};
 
 	union
 	{
@@ -79,6 +81,8 @@ struct MemoryRequest
 		size = other.size;
 		flags = other.flags;
 		dst = other.dst;
+		host_trace_token = other.host_trace_token;
+		host_trace_entry_cycle = other.host_trace_entry_cycle;
 		port = other.port;
 		paddr = other.paddr;
 		std::memcpy(data, other.data, other.size);
@@ -94,6 +98,7 @@ struct MemoryReturn
 	MemoryRequest::Flags flags{};
 	uint16_t port{0};
 	BitStack58 dst{};
+	uint64_t host_trace_token{0}; // Host-only FTB memory observer identity.
 
 	union
 	{
@@ -124,6 +129,7 @@ struct MemoryReturn
 		size = request.size;
 		flags = request.flags;
 		dst = request.dst;
+		host_trace_token = request.host_trace_token;
 		port = request.port;
 		paddr = request.paddr;
 		if(data) std::memcpy(this->data, data, size);
@@ -136,6 +142,7 @@ struct MemoryReturn
 		size = other.size;
 		flags = other.flags;
 		dst = other.dst;
+		host_trace_token = other.host_trace_token;
 		port = other.port;
 		paddr = other.paddr;
 		std::memcpy(data, other.data, size);

@@ -81,6 +81,7 @@ protected:
 		bool prefetch{false};
 		bool demand_seen{false};
 		bool filled{false};
+		uint64_t host_fill_token{0}; // FTB observation only; never used by cache control.
 		MSHR() = default;
 	};
 
@@ -114,6 +115,61 @@ protected:
 	std::set<paddr_t> _prefetched_sectors;
 	bool _block_prefetch;
 	bool _miss_alloc;
+
+	// All mutable trace state is owned by this unit's clock methods. External
+	// write_request only stamps a local transaction copy; read_return is unchanged.
+	struct MemoryPathRequest
+	{
+		uint64_t token{0}, address{0}, local_address{0};
+		uint64_t entry{0}, accepted{0}, lookup_ready{0}, lookup{0};
+		uint64_t miss_enqueued{0}, resolve{0}, fill_token{0}, fill_ready{0};
+		uint64_t data_ready{0}, response_enqueue{0}, return_emit{0};
+		uint size{0}, port{0};
+		bool prefetch_origin{false}, initial_lookup_hit{false}, source_prefetch{false};
+		std::string path;
+	};
+	struct MemoryPathFill
+	{
+		uint64_t token{0}, address{0}, local_address{0}, trigger_token{0};
+		uint64_t allocated{0}, issue{0}, fill_ready{0}, retired{0};
+		bool prefetch_origin{false};
+		std::string source;
+	};
+	bool _memory_path_enabled{false};
+	uint16_t _memory_path_unit{0};
+	uint _memory_path_partition{0}, _memory_path_partitions{1}, _memory_path_stride{1};
+	std::pair<paddr_t, paddr_t> _memory_path_ftb_range{0, 0};
+	uint64_t _memory_path_sequence{0}, _memory_path_errors{0};
+	std::vector<MemoryPathRequest> _memory_path_requests;
+	std::vector<MemoryPathFill> _memory_path_fills;
+	std::unordered_map<uint64_t, size_t> _memory_path_request_index, _memory_path_fill_index;
+	uint64_t _memory_path_cycle() const;
+	paddr_t _memory_path_global_address(paddr_t address) const;
+	bool _memory_path_ftb(paddr_t address, uint size) const;
+	void _memory_path_error();
+	MemoryPathRequest* _memory_path_request(uint64_t token);
+	void _memory_path_accept(const MemoryRequest& request);
+	void _memory_path_lookup_ready(const MemoryRequest& request);
+	void _memory_path_lookup(const MemoryRequest& request, bool hit);
+	void _memory_path_miss_enqueue(const MemoryRequest& request);
+	void _memory_path_hit(const MemoryRequest& request, const char* path);
+	void _memory_path_attach(const MemoryRequest& request, const MSHR& mshr, const char* path);
+	void _memory_path_new_fill(MSHR& mshr, MemoryRequest& fill, const MemoryRequest* trigger, const char* source);
+	void _memory_path_fill_ready(MSHR& mshr, const MemoryReturn& ret);
+	void _memory_path_response(const MemoryRequest& request);
+	void _memory_path_emit(const MemoryReturn& ret);
+
+public:
+	struct MemoryPathTotals
+	{
+		uint64_t requests{0}, fills{0}, errors{0}, incomplete_requests{0}, incomplete_fills{0};
+	};
+	void configure_memory_path_diagnostics(bool enabled, uint16_t diagnostic_unit,
+		std::pair<paddr_t, paddr_t> global_ftb_range, uint partition = 0, uint partitions = 1, uint stride = 1);
+	static void memory_path_headers(std::ostream& requests, std::ostream& fills);
+	MemoryPathTotals write_memory_path_diagnostics(std::ostream& requests, std::ostream& fills) const;
+
+protected:
 
 	uint _get_bank(paddr_t addr)
 	{

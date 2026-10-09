@@ -18,6 +18,7 @@ UnitTP::UnitTP(const Configuration& config) :
 	_cheat_memory(config.cheat_memory),
 	_num_threads(config.num_threads), 
 	_track_posted_stores(config.track_posted_stores),
+	_memory_request_observer(config.memory_request_observer),
 	_thread_exec_arbiter(config.num_threads),
 	_thread_data(config.num_threads),
 	_stack_mask(generate_nbit_mask(log2i(config.stack_size))),
@@ -350,6 +351,7 @@ void UnitTP::clock_fall()
 			_set_dependancies(thread_id);
 
 			UnitMemoryBase* mem = (UnitMemoryBase*)_unit_table[(uint)thread.instr_info.instr_type];
+			if(_memory_request_observer) _memory_request_observer(thread_id, thread.instr_info.instr_type, req);
 			mem->write_request(req);
 		}
 		else

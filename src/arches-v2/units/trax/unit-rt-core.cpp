@@ -17,8 +17,26 @@ UnitRTCore<NT, PT>::UnitRTCore(const Configuration& config) :
 	_stack_trend_prefetch(config.stack_trend_prefetch),
 	_ttp_max_distance(config.ttp_max_distance), _ttp_leaf_prefetch(config.ttp_leaf_prefetch),
 	_prefetch_queue_size(config.prefetch_queue_size),
-	_hit_observer(config.hit_observer)
+	_canonical_ftb_observer(config.canonical_ftb_observer),
+	_hit_observer(config.hit_observer), _ray_id_observer(config.ray_id_observer),
+	_identified_hit_observer(config.identified_hit_observer)
 {
+	if(config.ftb_wait_diagnostics)
+	{
+		if(!(std::is_same_v<NT, rtm::HE2CWBVH::Node> && std::is_same_v<PT, rtm::FTB>) ||
+			!_ray_id_observer || !_canonical_ftb_observer)
+			throw std::invalid_argument("FTB wait diagnostics require HE2/FTB and host identity observers");
+		_ftb_wait = std::make_unique<FTBWaitDiagnostics>(config.max_rays);
+	}
+	if(config.ftb_memory_diagnostics)
+	{
+		if(!_ftb_wait) throw std::invalid_argument("FTB memory diagnostics require FTB wait diagnostics");
+		_memory_path = std::make_unique<MemoryPathOrigins>(config.memory_path_unit_id);
+	}
+	log.ftb_fetch.enabled = _compact_ftb;
+	log.ftb_basic_decode.enabled = _compact_ftb;
+	log.ftb_basic_decode.resident_slots = config.max_rays;
+	log.ftb_basic_decode.ports = config.num_cache_ports;
 	_assert(_ttp_max_distance >= 2 && _ttp_max_distance <= RayState::STACK_SIZE);
 	_ray_states.resize(config.max_rays);
 	for(uint i = 0; i < _ray_states.size(); ++i)
@@ -28,11 +46,27 @@ UnitRTCore<NT, PT>::UnitRTCore(const Configuration& config) :
 	}
 
 	_cache_fetch_queues.resize(config.num_cache_ports);
+	if(_compact_ftb)
+	{
+		_ftb_decode_countdown.resize(config.max_rays, 0);
+		_ftb_decode_ready_counts.resize(config.num_cache_ports, 0); // Host observation, not target arbitration.
+		if(_ftb_wait) _ftb_basic_index.resize(config.max_rays, ~size_t(0));
+	}
 }
 template<typename NT, typename PT>
 void UnitRTCore<NT, PT>::clock_rise()
 {
+	if(_compact_ftb)
+	{
+		++_ftb_decode_cycle;
+	}
 	_prefetch_stack_read_used = false;
+	if(_ftb_wait)
+	{
+		++_ftb_wait_cycle;
+		for(uint ray_id = 0; ray_id < _ray_states.size(); ++ray_id)
+			_ftb_wait->phase(ray_id, static_cast<uint>(_ray_states[ray_id].phase));
+	}
 	// Phase occupancy is sampled once per global cycle, not once per scheduler subcycle.
 	for(const RayState& ray_state : _ray_states)
 	{
@@ -42,6 +76,8 @@ void UnitRTCore<NT, PT>::clock_rise()
 
 	_request_network.clock();
 	_read_requests();
+	// Advance old admissions once per global cycle, before any new data returns.
+	if(_compact_ftb) _advance_ftb_basic_decode();
 	_read_returns();
 
 	//n stack ops per cycle. In reality this would need to be multi banked
@@ -96,18 +132,60 @@ bool UnitRTCore<NT, PT>::_try_queue_node(uint ray_id, uint node_id)
 }
 
 template<typename NT, typename PT>
+paddr_t UnitRTCore<NT, PT>::_primitive_address(uint encoded_id) const
+{
+	if(_compact_ftb)
+		return _tri_base_addr + static_cast<paddr_t>(rtm::compact_ftb::leaf_slot(encoded_id)) * 64;
+	if(typeid(NT) == typeid(rtm::HECWBVH::Node))
+		return _node_base_addr + encoded_id * sizeof(NT);
+	return _tri_base_addr + encoded_id * sizeof(PT);
+}
+
+template<typename NT, typename PT>
+uint UnitRTCore<NT, PT>::_primitive_bytes(uint encoded_id) const
+{
+	return _compact_ftb ? rtm::compact_ftb::leaf_bytes(encoded_id) : sizeof(PT);
+}
+
+template<typename NT, typename PT>
+void UnitRTCore<NT, PT>::_record_ftb_completion(uint ray_id, uint required_bytes, uint requested_sectors)
+{
+	const uint physical = _primitive_bytes(_ray_states[ray_id].buffer.id) / MemoryRequest::MAX_SIZE;
+	_assert(requested_sectors == physical);
+	++log.ftb_fetch.completed_blocks;
+	++log.ftb_fetch.required_sectors[required_bytes / MemoryRequest::MAX_SIZE - 1];
+	++log.ftb_fetch.requested_sectors[requested_sectors - 1];
+	++log.ftb_fetch.physical_blocks[physical / 2 - 1];
+	log.ftb_fetch.demand_physical_sectors += physical;
+	log.ftb_fetch.demand_sectors_saved += sizeof(rtm::FTB) / MemoryRequest::MAX_SIZE - requested_sectors;
+}
+
+template<typename NT, typename PT>
 bool UnitRTCore<NT, PT>::_try_queue_tri(uint ray_id, uint tri_id)
 {
-	paddr_t start = _tri_base_addr + tri_id * sizeof(PT);
-	if(typeid(NT) == typeid(rtm::HECWBVH::Node))
-		start = _node_base_addr + tri_id * sizeof(NT);
-	paddr_t end = start + sizeof(PT);
+	if(_compact_ftb)
+	{
+		_assert(_ftb_decode_countdown[ray_id] == 0);
+		if(!_ftb_basic_index.empty()) _ftb_basic_index[ray_id] = ~size_t(0);
+	}
+	const paddr_t start = _primitive_address(tri_id);
+	const uint physical_bytes = _primitive_bytes(tri_id);
+	paddr_t end = start + physical_bytes;
 
 	RayState& ray_state = _ray_states[ray_id];
 	ray_state.buffer.address = start;
 	ray_state.buffer.bytes_filled = 0;
 	ray_state.buffer.type = 1;
 	ray_state.buffer.id = tri_id;
+	if(_ftb_wait) _ftb_wait->begin(ray_id, ray_id % _cache_fetch_queues.size(), tri_id,
+		_canonical_ftb_observer(tri_id), start, physical_bytes, _ftb_wait_cycle);
+	if(_compact_ftb)
+	{
+		// Preserve the original128B staging capacity and never expose stale short-block tails.
+		std::memset(&ray_state.buffer.prim, 0, sizeof(PT));
+		log.ftb_fetch.enabled = true;
+		_assert(start % MemoryRequest::MAX_SIZE == 0 && (physical_bytes == 64 || physical_bytes == 128));
+	}
 
 	//split request at cache boundries
 	//queue the requests to fill the buffer
@@ -122,6 +200,9 @@ bool UnitRTCore<NT, PT>::_try_queue_tri(uint ray_id, uint tri_id)
 		req.size = next_boundry - addr;
 		req.dst.push(ray_id, 10);
 		_cache_fetch_queues[ray_id % _cache_fetch_queues.size()].push(req);
+		if(_ftb_wait) _ftb_wait->enqueue(ray_id, static_cast<uint>((addr - start) / MemoryRequest::MAX_SIZE),
+			_ftb_wait_cycle, _cache_fetch_queues[ray_id % _cache_fetch_queues.size()].size() - 1);
+		if(_compact_ftb) ++log.ftb_fetch.demand_sectors_requested;
 
 		addr += req.size;
 	}
@@ -282,11 +363,10 @@ bool UnitRTCore<NT, PT>::_scan_stack_trend_candidate()
 			}
 			else
 			{
-				// A leaf entry can describe multiple FTBs; fetch only its next block.
-				addr = _tri_base_addr + entry.data.prim_idx * sizeof(PT);
-				if(typeid(NT) == typeid(rtm::HECWBVH::Node))
-					addr = _node_base_addr + entry.data.prim_idx * sizeof(NT);
-				size = sizeof(PT);
+				// Legacy entries can describe several blocks. Compact entries
+				// describe one 64/128B allocation, whose size flag stays in prim_idx.
+				addr = _primitive_address(entry.data.prim_idx);
+				size = _primitive_bytes(entry.data.prim_idx);
 			}
 			advance = _try_queue_prefetch(ray_id, addr, size, 0);
 			if(!advance) ++log.ttp_queue_full;
@@ -318,6 +398,8 @@ void UnitRTCore<NT, PT>::_read_requests()
 
 		RayState& ray_state = _ray_states[ray_id];
 		std::memcpy(&ray_state.ray, request.data, sizeof(rtm::Ray));
+		ray_state.original_ray_id = _ray_id_observer ? _ray_id_observer(request) : ~0ull;
+		if(_ftb_wait) _ftb_wait->admission(ray_id, ray_state.original_ray_id, _ftb_wait_cycle);
 		ray_state.inv_d = rtm::vec3(1.0f) / ray_state.ray.d;
 		ray_state.hit.t = ray_state.ray.t_max;
 		ray_state.hit.bc = rtm::vec2(0.0f);
@@ -352,6 +434,54 @@ void UnitRTCore<NT, PT>::_read_requests()
 }
 
 template<typename NT, typename PT>
+void UnitRTCore<NT, PT>::_queue_tri_isect(uint ray_id)
+{
+	_ray_states[ray_id].phase = RayState::Phase::TRI_ISECT;
+	if(_compact_ftb)
+	{
+		_assert(_ftb_decode_countdown[ray_id] == 0);
+		_ftb_decode_countdown[ray_id] = FTB_BASIC_DECODE_LATENCY;
+		auto& diagnostic = log.ftb_basic_decode;
+		diagnostic.enabled = true; diagnostic.resident_slots = _max_rays;
+		diagnostic.ports = static_cast<uint>(_cache_fetch_queues.size());
+		++diagnostic.started;
+		if(!_ftb_basic_index.empty())
+		{
+			const auto& access = _ftb_wait->active_access(ray_id);
+			_ftb_basic_index[ray_id] = _ftb_basic_accesses.size();
+			_ftb_basic_accesses.push_back({access.original_ray_id, access.leaf_ordinal,
+				access.canonical_ftb_id, access.port, ray_id, _ftb_decode_cycle, 0, 0});
+		}
+	}
+	_tri_isect_queue.push(ray_id);
+}
+
+template<typename NT, typename PT>
+void UnitRTCore<NT, PT>::_advance_ftb_basic_decode()
+{
+	// Constant latency preserves the original return-port II1: each port admits
+	// at most one full block per cycle, so at most one becomes ready two cycles later.
+	// Per-port counts are observation only; no separate hardware completion arbiter exists.
+	std::fill(_ftb_decode_ready_counts.begin(), _ftb_decode_ready_counts.end(), uint8_t(0));
+	for(uint ray_id = 0; ray_id < _ftb_decode_countdown.size(); ++ray_id)
+	{
+		auto& countdown = _ftb_decode_countdown[ray_id];
+		if(!countdown) continue;
+		_assert(_ray_states[ray_id].phase == RayState::Phase::TRI_ISECT);
+		++log.ftb_basic_decode.service_ray_cycles;
+		if(--countdown == 0)
+		{
+			++log.ftb_basic_decode.completed;
+			const uint port = ray_id % _cache_fetch_queues.size();
+			const uint ready_count = ++_ftb_decode_ready_counts[port];
+			_assert(ready_count == 1);
+			log.ftb_basic_decode.ready_per_port_cycle_max = std::max<uint64_t>(log.ftb_basic_decode.ready_per_port_cycle_max, ready_count);
+			if(!_ftb_basic_index.empty()) _ftb_basic_accesses[_ftb_basic_index[ray_id]].decode_ready = _ftb_decode_cycle;
+		}
+	}
+}
+
+template<typename NT, typename PT>
 void UnitRTCore<NT, PT>::_read_returns()
 {
 	for(uint i = 0; i < _cache_fetch_queues.size(); ++i)
@@ -379,15 +509,42 @@ void UnitRTCore<NT, PT>::_read_returns()
 			}
 			else if(buffer.type == 1)
 			{
+				if constexpr(std::is_same_v<PT, rtm::FTB>)
+				{
+					if(_compact_ftb)
+					{
+						if(ray_state.phase != RayState::Phase::TRI_FETCH) continue;
+						const uint physical_bytes = _primitive_bytes(buffer.id);
+						if(ret.paddr < buffer.address || ret.paddr >= buffer.address + physical_bytes)
+							throw std::runtime_error("FTB return lies outside its physical allocation");
+						const uint offset = static_cast<uint>(ret.paddr - buffer.address);
+						if(offset % MemoryRequest::MAX_SIZE || ret.size != MemoryRequest::MAX_SIZE)
+							throw std::runtime_error("FTB return violates aligned physical fetch accounting");
+						const uint sector = offset / MemoryRequest::MAX_SIZE;
+						const uint bit = 1u << sector;
+						if(buffer.bytes_filled & bit) throw std::runtime_error("FTB physical fetch received a duplicate sector");
+						if(_ftb_wait) _ftb_wait->returned(ray_id, sector, _ftb_wait_cycle);
+						if(_memory_path) _memory_path->returned(ret.host_trace_token, ret.paddr, _ftb_wait_cycle);
+						// Reuse the existing counter as a mask, so repeated data cannot complete a missing sector.
+						std::memcpy((uint8_t*)&buffer.data + offset, ret.data, ret.size);
+						buffer.bytes_filled |= bit;
+						++log.ftb_fetch.demand_sectors_returned;
+						const uint expected_mask = (1u << (physical_bytes / MemoryRequest::MAX_SIZE)) - 1;
+						if(buffer.bytes_filled == expected_mask)
+						{
+							const uint required = rtm::compact_ftb::required_bytes(buffer.prim); // Validation/observation only.
+							if(required > physical_bytes) throw std::runtime_error("FTB encoded length exceeds physical allocation");
+							_record_ftb_completion(ray_id, required, physical_bytes / MemoryRequest::MAX_SIZE);
+							if(_ftb_wait) _ftb_wait->complete(ray_id, required, _ftb_wait_cycle);
+							_queue_tri_isect(ray_id);
+						}
+						continue;
+					}
+				}
 				uint offset = (ret.paddr - buffer.address);
 				std::memcpy((uint8_t*)&buffer.data + offset, ret.data, ret.size);
 				buffer.bytes_filled += ret.size;
-				if(buffer.bytes_filled == sizeof(PT))
-				{
-
-					ray_state.phase = RayState::Phase::TRI_ISECT;
-					_tri_isect_queue.push(ray_id);
-				}
+				if(buffer.bytes_filled == _primitive_bytes(buffer.id)) _queue_tri_isect(ray_id);
 			}
 		}
 	}
@@ -400,7 +557,7 @@ void UnitRTCore<NT, PT>::_schedule_ray()
 	if(!_ray_scheduling_queue.empty())
 	{
 		_stall_cycles = 0;
-		uint ray_id = _ray_scheduling_queue.front();
+		const uint ray_id = _ray_scheduling_queue.front();
 		_ray_scheduling_queue.pop();
 
 		RayState& ray_state = _ray_states[ray_id];
@@ -477,6 +634,8 @@ void UnitRTCore<NT, PT>::_schedule_ray()
 			}
 			else
 			{
+				if(_compact_ftb && entry.data.prim_cnt != 1)
+					throw std::runtime_error("Compact FTB leaf must contain exactly one encoded allocation");
 				_try_queue_tri(ray_id, entry.data.prim_idx);
 				if(entry.data.prim_cnt > 1)
 				{
@@ -530,7 +689,11 @@ void UnitRTCore<NT, PT>::_simualte_node_pipline()
 		const rtm::vec3& inv_d = ray_state.inv_d;
 
 		rtm::BVH::Node nodes[32];
-		uint node_count = rtm::decompress(ray_state.buffer.node, nodes);
+		uint node_count;
+		if constexpr(std::is_same_v<NT, rtm::HE2CWBVH::Node> && std::is_same_v<PT, rtm::FTB>)
+			node_count = _compact_ftb ? rtm::compact_ftb::decompress(ray_state.buffer.node, nodes) :
+				rtm::decompress(ray_state.buffer.node, nodes);
+		else node_count = rtm::decompress(ray_state.buffer.node, nodes);
 
 		_box_issue_count += 8;
 		if(_box_issue_count >= node_count)
@@ -629,15 +792,23 @@ void UnitRTCore<NT, PT>::_simualte_node_pipline()
 template<typename NT, typename PT>
 void UnitRTCore<NT, PT>::_simualte_tri_pipline()
 {
-	if(!_tri_isect_queue.empty() && _tri_pipline.is_write_valid())
+	if(!_tri_isect_queue.empty() && _tri_pipline.is_write_valid() &&
+		(!_compact_ftb || _ftb_decode_countdown[_tri_isect_queue.front()] == 0))
 	{
 		_stall_cycles = 0;
 		uint ray_id = _tri_isect_queue.front();
 		RayState& ray_state = _ray_states[ray_id];
 		StagingBuffer& buffer = ray_state.buffer;
+		if(_compact_ftb && _tri_issue_count == 0)
+		{
+			++log.ftb_basic_decode.first_issues;
+			if(!_ftb_basic_index.empty()) _ftb_basic_accesses[_ftb_basic_index[ray_id]].first_tri_issue = _ftb_decode_cycle;
+		}
 
 		rtm::IntersectionTriangle tris[rtm::FTB::MAX_TRIS];
-		uint tri_count = rtm::decompress(buffer.prim, tris);
+		// Functional reconstruction already understands the encoded common prefixes.
+		// The separate fixed baseline gate above charges its abstract target delay.
+		const uint tri_count = rtm::decompress(buffer.prim, tris);
 
 		_tri_issue_count += 1;
 		if(_tri_issue_count >= tri_count)
@@ -688,7 +859,26 @@ void UnitRTCore<NT, PT>::_issue_requests()
 		if(!_cache_fetch_queues[i].empty() && _cache->request_port_write_valid(port))
 		{
 			_cache_fetch_queues[i].front().port = port;
+			if(_memory_path)
+			{
+				auto& request = _cache_fetch_queues[i].front();
+				auto dst = request.dst;
+				const uint ray_id = dst.pop(10);
+				const auto& state = _ray_states[ray_id];
+				if(state.phase == RayState::Phase::TRI_FETCH && state.buffer.type == 1)
+					request.host_trace_token = _memory_path->issue(_ftb_wait->active_access(ray_id),
+						static_cast<uint>((request.paddr - state.buffer.address) / MemoryRequest::MAX_SIZE), request.paddr, _ftb_wait_cycle);
+			}
 			_cache->write_request(_cache_fetch_queues[i].front());
+			if(_ftb_wait)
+			{
+				const MemoryRequest& request = _cache_fetch_queues[i].front();
+				auto dst = request.dst;
+				const uint ray_id = dst.pop(10);
+				const auto& state = _ray_states[ray_id];
+				if(state.phase == RayState::Phase::TRI_FETCH && state.buffer.type == 1)
+					_ftb_wait->issue(ray_id, static_cast<uint>((request.paddr - state.buffer.address) / MemoryRequest::MAX_SIZE), _ftb_wait_cycle);
+			}
 			_cache_fetch_queues[i].pop();
 			if(_prefetch_enabled()) demand_selected[i] = 1;
 		}
@@ -749,6 +939,8 @@ void UnitRTCore<NT, PT>::_issue_returns()
 			std::memcpy(ret.data, &ray_state.hit, sizeof(rtm::Hit));
 			_return_network.write(ret, 0);
 			if(_hit_observer) _hit_observer(ray_state.ray, ray_state.hit);
+			if(_identified_hit_observer) _identified_hit_observer(ray_state.original_ray_id, ray_state.ray, ray_state.hit);
+			if(_ftb_wait) _ftb_wait->hit_return(ray_id, _ftb_wait_cycle);
 
 			ray_state.phase = RayState::Phase::RAY_FETCH;
 			_free_ray_ids.insert(ray_id);

@@ -2,6 +2,8 @@
 
 #include "stdafx.hpp"
 
+#include <functional>
+
 #include "unit-base.hpp"
 #include "unit-memory-base.hpp"
 #include "unit-sfu.hpp"
@@ -29,6 +31,9 @@ public:
 		uint num_threads{8};
 		bool track_posted_stores{false}; // Enable only with a backend that commits posted_store requests.
 		uint stack_size{512};
+
+		// Host-only observation of an issued global memory instruction.
+		std::function<void(uint, ISA::RISCV::InstrType, const MemoryRequest&)> memory_request_observer{};
 
 		const std::vector<UnitBase*>* unit_table{nullptr};
 		const std::vector<UnitSFU*>* unique_sfus{nullptr};
@@ -67,6 +72,7 @@ protected:
 	uint _last_thread_id;
 	uint _num_threads;
 	bool _track_posted_stores;
+	std::function<void(uint, ISA::RISCV::InstrType, const MemoryRequest&)> _memory_request_observer;
 	uint _num_halted_threads;
 	RoundRobinArbiter<uint16_t> _thread_exec_arbiter;
 	std::vector<ThreadData> _thread_data;

@@ -1,6 +1,11 @@
 #pragma once
 #include "stdafx.hpp"
 #include "include.hpp"
+#ifndef __riscv
+#include "rtm/compact-ftb.hpp"
+#include <type_traits>
+#include <stdexcept>
+#endif
 
 template<uint32_t FLAGS>
 inline void _traceray(uint id, const rtm::Ray& ray, rtm::Hit& hit)
@@ -191,8 +196,16 @@ struct IntersectStats
 };
 
 template <typename N, typename P>
-inline bool intersect(const N* cnodes, const P* cprims, const rtm::Ray& ray, rtm::Hit& hit, IntersectStats& stats)
+inline bool intersect(const N* cnodes, const P* cprims, const rtm::Ray& ray, rtm::Hit& hit, IntersectStats& stats
+#ifndef __riscv
+	, bool compact_ftb = false
+#endif
+)
 {
+#ifndef __riscv
+	if constexpr(!(std::is_same_v<N, rtm::HE2CWBVH::Node> && std::is_same_v<P, rtm::FTB>))
+		if(compact_ftb) throw std::invalid_argument("Compact FTB native traversal requires HE2 nodes and FTB payload");
+#endif
 	rtm::vec3 inv_d = rtm::vec3(1.0f) / ray.d;
 
 	struct NodeStackEntry
@@ -218,7 +231,16 @@ inline bool intersect(const N* cnodes, const P* cprims, const rtm::Ray& ray, rtm
 		if(entry.ptr.is_int)
 		{
 			rtm::BVH::Node nodes[16];
-			uint node_count = rtm::decompress(cnodes[entry.ptr.child_idx], nodes);
+			uint node_count;
+#ifndef __riscv
+			if constexpr(std::is_same_v<N, rtm::HE2CWBVH::Node> && std::is_same_v<P, rtm::FTB>)
+			{
+				if(compact_ftb) node_count = rtm::compact_ftb::decompress(cnodes[entry.ptr.child_idx], nodes);
+				else node_count = rtm::decompress(cnodes[entry.ptr.child_idx], nodes);
+			}
+			else
+#endif
+			node_count = rtm::decompress(cnodes[entry.ptr.child_idx], nodes);
 
 			uint max_insert_depth = node_stack_size, last_ptr = ~0u, last_j = ~0u;
 			for(uint i = 0; i < node_count; ++i)
@@ -259,7 +281,29 @@ inline bool intersect(const N* cnodes, const P* cprims, const rtm::Ray& ray, rtm
 		{
 		#if 1
 			rtm::IntersectionTriangle tris[rtm::FTB::MAX_TRIS];
-			uint tri_count = rtm::decompress(cprims[entry.ptr.prim_idx], tris);
+			uint tri_count;
+#ifndef __riscv
+			if constexpr(std::is_same_v<N, rtm::HE2CWBVH::Node> && std::is_same_v<P, rtm::FTB>)
+			{
+				if(compact_ftb)
+				{
+					// The caller supplies a validated byte arena through the existing
+					// pointer type. Never index/dereference it as an FTB array: 64B
+					// allocations may share a line and the arena need not be 64B aligned.
+					const uint encoded = entry.ptr.prim_idx;
+					const uint bytes = rtm::compact_ftb::leaf_bytes(encoded);
+					const size_t offset = size_t(rtm::compact_ftb::leaf_slot(encoded)) * 64;
+					rtm::FTB block{};
+					std::memcpy(&block, reinterpret_cast<const uint8_t*>(cprims) + offset, bytes);
+					if(rtm::compact_ftb::required_bytes(block) > bytes)
+						throw std::invalid_argument("Compact FTB header exceeds native leaf allocation");
+					tri_count = rtm::decompress(block, tris);
+				}
+				else tri_count = rtm::decompress(cprims[entry.ptr.prim_idx], tris);
+			}
+			else
+#endif
+			tri_count = rtm::decompress(cprims[entry.ptr.prim_idx], tris);
 			for(uint i = 0; i < tri_count; ++i)
 				if(_intersect(tris[i].tri, ray, hit))
 				{

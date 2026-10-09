@@ -37,6 +37,13 @@ bool UnitDRAMRamulator::request_port_write_valid(uint port_index)
 
 void UnitDRAMRamulator::write_request(const MemoryRequest& request)
 {
+	if(_memory_path_diagnostics && request.type == MemoryRequest::Type::LOAD && request.host_trace_token)
+	{
+		MemoryRequest observed = request;
+		observed.host_trace_entry_cycle = static_cast<uint64_t>(simulator->current_cycle) + 1;
+		_request_network.write(observed, observed.port);
+		return;
+	}
 	_request_network.write(request, request.port);
 }
 
@@ -72,6 +79,47 @@ float UnitDRAMRamulator::total_power()
 	return 0.0f;
 }
 
+void UnitDRAMRamulator::configure_memory_path_diagnostics(bool enabled)
+{
+	_memory_path_diagnostics = enabled;
+	_memory_path_errors = 0;
+	_memory_path_records.clear();
+	_memory_path_return_records.clear();
+}
+
+void UnitDRAMRamulator::memory_path_header(std::ostream& output)
+{
+	output << "dram,controller,token,paddr,return_id,size,entry_cycle,accepted_cycle,callback_cycle,callback_dram_tick,ramulator_arrive_tick,ramulator_depart_tick,emit_cycle\n";
+}
+
+void UnitDRAMRamulator::_memory_path_error()
+{
+	++_memory_path_errors;
+}
+
+UnitDRAMRamulator::MemoryPathTotals UnitDRAMRamulator::write_memory_path_diagnostics(std::ostream& output, uint dram_id) const
+{
+	MemoryPathTotals totals;
+	totals.errors = _memory_path_errors;
+	for(const auto& record : _memory_path_records)
+	{
+		++totals.transactions;
+		totals.callbacks += record.callback_cycle != 0;
+		totals.emitted += record.emit_cycle != 0;
+		if(!record.token || !record.entry_cycle || record.accepted_cycle < record.entry_cycle ||
+			!record.callback_cycle || record.callback_cycle < record.accepted_cycle ||
+			!record.emit_cycle || record.emit_cycle < record.callback_cycle ||
+			record.ramulator_depart_tick < 0 ||
+			(record.ramulator_depart_tick >= 0 && record.callback_dram_tick < static_cast<uint64_t>(record.ramulator_depart_tick)))
+			++totals.errors;
+		output << dram_id << ',' << record.controller << ',' << record.token << ',' << record.paddr << ','
+			<< record.return_id << ',' << record.size << ',' << record.entry_cycle << ','
+			<< record.accepted_cycle << ',' << record.callback_cycle << ',' << record.callback_dram_tick << ','
+			<< record.ramulator_arrive_tick << ',' << record.ramulator_depart_tick << ',' << record.emit_cycle << '\n';
+	}
+	return totals;
+}
+
 
 bool UnitDRAMRamulator::_load(const MemoryRequest& request, uint channel_index)
 {
@@ -89,13 +137,33 @@ bool UnitDRAMRamulator::_load(const MemoryRequest& request, uint channel_index)
 		_free_return_ids.pop();
 	}
 
-	bool enqueue_success = _controllers[channel_index].ramulator2_frontend->receive_external_requests(0, _convert_address(request.paddr), return_id, [this, channel_index](Ramulator::Request& req)
+	const uint64_t trace_token = _memory_path_diagnostics ? request.host_trace_token : 0;
+	bool enqueue_success = _controllers[channel_index].ramulator2_frontend->receive_external_requests(0, _convert_address(request.paddr), return_id, [this, channel_index, trace_token](Ramulator::Request& req)
 	{
 		// your read request callback 
 #if ENABLE_DRAM_DEBUG_PRINTS
 		printf("Load: 0x%llx(%d, %d, %d, %d, %d): %d cycles\n", req.addr, req.addr_vec[0], req.addr_vec[1], req.addr_vec[2], req.addr_vec[3], req.addr_vec[4], (req.depart - req.arrive) / _clock_ratio);
 #endif
 		_controllers[channel_index].return_queue.push({ req.depart, (uint)req.source_id });
+		if(trace_token)
+		{
+			const uint observed_return_id = static_cast<uint>(req.source_id);
+			if(observed_return_id >= _memory_path_return_records.size() || !_memory_path_return_records[observed_return_id])
+				_memory_path_error();
+			else
+			{
+				auto& record = _memory_path_records[_memory_path_return_records[observed_return_id] - 1];
+				if(record.token != trace_token || record.callback_cycle)
+					_memory_path_error();
+				else
+				{
+					record.callback_cycle = static_cast<uint64_t>(simulator->current_cycle) + 1;
+					record.callback_dram_tick = static_cast<uint64_t>(_current_cycle);
+					record.ramulator_arrive_tick = req.arrive;
+					record.ramulator_depart_tick = req.depart;
+				}
+			}
+		}
 	});
 
 	if (enqueue_success)
@@ -106,6 +174,22 @@ bool UnitDRAMRamulator::_load(const MemoryRequest& request, uint channel_index)
 		log.loads++;
 		if(_load_map[request.paddr]++ == 0) log.unique_loads++;
 		if(_row_map[request.paddr & ~0x1fff]++ == 0) log.unique_rows++;
+		if(trace_token)
+		{
+			MemoryPathRecord record;
+			record.token = trace_token;
+			record.paddr = request.paddr; // Partition-local Arches address.
+			record.controller = channel_index;
+			record.return_id = return_id;
+			record.size = request.size;
+			record.entry_cycle = request.host_trace_entry_cycle;
+			record.accepted_cycle = static_cast<uint64_t>(simulator->current_cycle) + 1;
+			_memory_path_records.push_back(record);
+			if(_memory_path_return_records.size() <= return_id)
+				_memory_path_return_records.resize(static_cast<size_t>(return_id) + 1, 0);
+			if(_memory_path_return_records[return_id]) _memory_path_error();
+			_memory_path_return_records[return_id] = _memory_path_records.size();
+		}
 	}
 
 	return enqueue_success;
@@ -218,6 +302,14 @@ void UnitDRAMRamulator::clock_fall()
 				_assert(_current_cycle >= ramulator_return.return_cycle);
 				log.bytes_read += ret.size;
 				_return_network.write(ret, controller_index);
+				if(_memory_path_diagnostics && ramulator_return.return_id < _memory_path_return_records.size() &&
+					_memory_path_return_records[ramulator_return.return_id])
+				{
+					auto& record = _memory_path_records[_memory_path_return_records[ramulator_return.return_id] - 1];
+					if(record.emit_cycle) _memory_path_error();
+					else record.emit_cycle = static_cast<uint64_t>(simulator->current_cycle) + 1;
+					_memory_path_return_records[ramulator_return.return_id] = 0;
+				}
 				_free_return_ids.push(ramulator_return.return_id);
 				controller.return_queue.pop();
 				_pending_requests--;

@@ -80,6 +80,25 @@ private:
 	std::map<paddr_t, uint> _load_map;
 	std::map<paddr_t, uint> _row_map;
 
+	// Host-only trace state. UnitDRAM owns all record writes in clock_rise / 
+	// clock_fall; cross-unit write_request only stamps a copied transaction.
+	struct MemoryPathRecord
+	{
+		uint64_t token{0}, paddr{0};
+		uint controller{0}, return_id{0}, size{0};
+		uint64_t entry_cycle{0}, accepted_cycle{0}, callback_cycle{0};
+		uint64_t callback_dram_tick{0};
+		int64_t ramulator_arrive_tick{-1}, ramulator_depart_tick{-1};
+		uint64_t emit_cycle{0};
+	};
+	bool _memory_path_diagnostics{false};
+	uint64_t _memory_path_errors{0};
+	std::vector<MemoryPathRecord> _memory_path_records;
+	// Zero means unobserved; otherwise record index + 1. Return IDs retain the
+	// original allocation/reuse behavior, including failed frontend attempts.
+	std::vector<size_t> _memory_path_return_records;
+	void _memory_path_error();
+
 public:
 	UnitDRAMRamulator(Configuration config);
 	virtual ~UnitDRAMRamulator() override;
@@ -96,6 +115,15 @@ public:
 
 	void print_stats(uint32_t const word_size, cycles_t cycle_count);
 	float total_power();
+
+	struct MemoryPathTotals
+	{
+		uint64_t transactions{0}, callbacks{0}, emitted{0}, errors{0};
+	};
+	// Configure before execute(). This observer never affects simulated state.
+	void configure_memory_path_diagnostics(bool enabled);
+	static void memory_path_header(std::ostream& output);
+	MemoryPathTotals write_memory_path_diagnostics(std::ostream& output, uint dram_id) const;
 
 	class Log
 	{

@@ -2,8 +2,12 @@
 #include <array>
 #include <iomanip>
 #include <limits>
+#include <unordered_map>
 
 #include "shared-utils.hpp"
+#include "ray-input.hpp"
+#include "rtm/compact-ftb.hpp"
+#include "rtm/ftb-prefix.hpp"
 #include "units/trax/unit-tp.hpp"
 #include "units/trax/unit-rt-core.hpp"
 #include "trax-kernel/include.hpp"
@@ -160,7 +164,22 @@ struct HitAuditRecord
 {
 	rtm::Ray ray;
 	rtm::Hit hit;
+	uint64_t original_ray_id{~0ull};
 };
+
+struct SceneLayoutInfo
+{
+	uint64_t ftb_occupied_bytes{0};
+	std::unordered_map<uint32_t, uint32_t> diagnostic_leaf_to_canonical; // Host-only; never a simulated LOAD.
+};
+
+static uint64_t fingerprint(const void* data, size_t bytes)
+{
+	const auto* p = static_cast<const uint8_t*>(data);
+	uint64_t hash = 14695981039346656037ull;
+	for(size_t i = 0; i < bytes; ++i) { hash ^= p[i]; hash *= 1099511628211ull; }
+	return hash;
+}
 
 static std::string ray_key(const rtm::Ray& ray)
 {
@@ -212,8 +231,13 @@ static bool equivalent_hit_tie(const HitAuditRecord& record, const rtm::Hit& ref
 	       std::abs(actual_geometry.bc.y - record.hit.bc.y) <= 1e-5f;
 }
 
-static TRaXKernelArgs initilize_buffers(Units::UnitMainMemoryBase** drams, const Units::UnitCrossbar& xbar, paddr_t& heap_address, const SimulationConfig& sim_config, uint page_size, std::map<std::string, HitReference>* expected_hits = nullptr, std::vector<rtm::Triangle>* validation_triangles = nullptr, std::vector<uint>* validation_materials = nullptr)
+static TRaXKernelArgs initilize_buffers(Units::UnitMainMemoryBase** drams, const Units::UnitCrossbar& xbar, paddr_t& heap_address, const SimulationConfig& sim_config, uint page_size, std::map<std::string, HitReference>* expected_hits = nullptr, std::vector<rtm::Triangle>* validation_triangles = nullptr, std::vector<uint>* validation_materials = nullptr, std::vector<rtm::Ray>* original_rays = nullptr, SceneLayoutInfo* layout_info = nullptr)
 {
+#if !USE_HECWBVH_V1 && TRAX_USE_RT_CORE
+	// Keep the selected compact format's verified canonical BVH contract.
+	if(sim_config.get_int("bvh-preset") != 0 || sim_config.get_int("bvh-merging") != 0)
+		throw std::invalid_argument("Fixed HE2 FTB format requires bvh-preset=0 and bvh-merging=0");
+#endif
 	std::string scene_name = sim_config.get_string("scene-name");
 	std::string project_folder = get_project_folder_path();
 	std::string datasets_folder = sim_config.get_string("dataset-dir") + "/";
@@ -236,17 +260,38 @@ static TRaXKernelArgs initilize_buffers(Units::UnitMainMemoryBase** drams, const
 	rtm::Mesh mesh(datasets_folder + scene_name + ".obj");
 	rtm::CWBVH bvh(mesh, (cache_folder + scene_name + ".bvh").c_str(), sim_config.get_int("bvh-preset"), sim_config.get_int("bvh-merging"));
 
+	printf("Final BVH fingerprint (FNV1a64): nodes=%zu bytes=%zu hash=%016llx; FTBs=%zu bytes=%zu hash=%016llx\n",
+		bvh.nodes.size(), bvh.nodes.size() * sizeof(bvh.nodes[0]), (unsigned long long)fingerprint(bvh.nodes.data(), bvh.nodes.size() * sizeof(bvh.nodes[0])),
+		bvh.ftbs.size(), bvh.ftbs.size() * sizeof(bvh.ftbs[0]), (unsigned long long)fingerprint(bvh.ftbs.data(), bvh.ftbs.size() * sizeof(bvh.ftbs[0])));
 	std::vector<rtm::Ray> rays(args.framebuffer_size);
 	if(args.pregen_rays)
 	{
-		std::string ray_file = scene_name + "-" + std::to_string(args.framebuffer_width) + "-" + std::to_string(pregen_bounce) + ".rays";
+		const auto input_path = sim_config.get_string("ray-input");
+		if(!input_path.empty())
+		{
+			const auto frozen = ray_input::read_file(input_path, args.framebuffer_width, args.framebuffer_height);
+			// IDs name original pixels, independently of record order in the file.
+			for(size_t i = 0; i < frozen.rays.size(); ++i)
+				std::memcpy(&rays[frozen.original_ray_ids[i]], &frozen.rays[i], sizeof(rtm::Ray));
+			printf("Replayed raw rays: %zu (original pixel IDs, existing 4x8 tile order)\n", rays.size());
+		}
+		else
+		{
 	#if USE_HECWBVH_V1
 		pregen_rays(&bvh.nodes[0], &bvh.nodes[0].ftb, mesh, args.framebuffer_width, args.framebuffer_height, args.camera, pregen_bounce, rays);
 	#else
 		pregen_rays(&bvh.nodes[0], &bvh.ftbs[0], mesh, args.framebuffer_width, args.framebuffer_height, args.camera, pregen_bounce, rays);
 	#endif
-		args.rays = write_vector(drams, xbar, 256, rays, heap_address);
+		}
+		const auto output_path = sim_config.get_string("ray-output");
+		if(!output_path.empty())
+		{
+			ray_input::write_file(output_path, args.framebuffer_width, args.framebuffer_height, rays);
+			printf("Exported raw rays: %zu\n", rays.size());
+		}
+		printf("Input rays fingerprint (FNV1a64): count=%zu bytes=%zu hash=%016llx\n", rays.size(), rays.size() * sizeof(rtm::Ray), (unsigned long long)fingerprint(rays.data(), rays.size() * sizeof(rtm::Ray)));
 	}
+	if(original_rays && args.pregen_rays) *original_rays = rays;
 
 	if(expected_hits)
 	{
@@ -266,15 +311,101 @@ static TRaXKernelArgs initilize_buffers(Units::UnitMainMemoryBase** drams, const
 		printf("Native reference rays: %zu unique inputs\n", expected_hits->size());
 	}
 
+	if(args.pregen_rays) args.rays = write_vector(drams, xbar, 256, rays, heap_address);
 	args.materials = write_vector(drams, xbar, 256, mesh.materials, heap_address);
 
+#if USE_HECWBVH_V1 || !TRAX_USE_RT_CORE
+	constexpr bool compact_ftb = false;
+#else
+	constexpr bool compact_ftb = true;
+#endif
+	rtm::compact_ftb::Layout packed;
+#if !USE_HECWBVH_V1 && TRAX_USE_RT_CORE
+	// Transform only the device representation. Canonical geometry, grouping,
+	// ray generation and the native oracle keep the original bvh.ftbs array.
+	const auto prefix = rtm::ftb_prefix::transform(bvh.ftbs);
+	const auto& prefix_stats = prefix.stats;
+	printf("FTB Prefix Codec: mode=1 version=1 blocks=%llu changed-blocks=%llu encoded-size-changed-blocks=%llu nonzero-prefix-blocks=%llu old-bits=%llu new-bits=%llu old-byte-ceil=%llu new-byte-ceil=%llu\n",
+		(unsigned long long)prefix_stats.blocks, (unsigned long long)prefix_stats.changed_blocks,
+		(unsigned long long)prefix_stats.encoded_size_changed_blocks, (unsigned long long)prefix_stats.nonzero_prefix_blocks,
+		(unsigned long long)prefix_stats.old_total_bits, (unsigned long long)prefix_stats.new_total_bits,
+		(unsigned long long)prefix_stats.old_sum_byte_ceil, (unsigned long long)prefix_stats.new_sum_byte_ceil);
+	printf("FTB Prefix Fingerprints (FNV1a64): canonical=%016llx encoded=%016llx; canonical array unchanged\n",
+		(unsigned long long)prefix.canonical_fingerprint, (unsigned long long)prefix.encoded_fingerprint);
+	for(uint i = 0; i < 4; ++i)
+		printf("FTB Prefix Required %uB Blocks: old=%llu new=%llu\n", (i + 1) * 32,
+			(unsigned long long)prefix_stats.old_required_hist[i], (unsigned long long)prefix_stats.new_required_hist[i]);
+	printf("FTB Prefix Validation: %llu/%llu blocks, local table/index and production triangle FP32 bit-exact PASS\n",
+		(unsigned long long)prefix_stats.blocks, (unsigned long long)prefix_stats.blocks);
+	printf("FTB Strategy: packed parent groups; lossless prefix; full physical64/128B upfront; basic decode2 after full-data admission\n");
+	printf("FTB Basic Decode Model: fixed two global cycles from full-data admission; original scalar rtm::decompress consumer; existing128B staging retained; modeled latency assumption, logic/ports/area/1515MHz timing unsynthesized\n");
+	packed = rtm::compact_ftb::build(bvh.nodes, prefix.ftbs);
+	if(expected_hits)
+	{
+		for(uint i = 0; i < args.framebuffer_size; ++i)
+		{
+			const rtm::Ray ray = args.pregen_rays ? rays[i] :
+				args.camera.generate_ray_through_pixel(i % args.framebuffer_width, i / args.framebuffer_width);
+			rtm::Hit actual(ray.t_max, rtm::vec2(0.0f), ~0u);
+			IntersectStats stats;
+			::intersect(packed.nodes.data(), reinterpret_cast<const rtm::FTB*>(packed.payload.data()), ray, actual, stats, true);
+			const auto& reference = expected_hits->at(ray_key(ray)).hit;
+			if(actual.id != reference.id || rtm::as_u32(actual.t) != rtm::as_u32(reference.t) ||
+			   rtm::as_u32(actual.bc.x) != rtm::as_u32(reference.bc.x) || rtm::as_u32(actual.bc.y) != rtm::as_u32(reference.bc.y))
+				throw std::runtime_error("Compact native traversal differs from canonical oracle at ray " + std::to_string(i));
+		}
+		printf("Compact native validation: %u/%u rays, bit-exact PASS\n", args.framebuffer_size, args.framebuffer_size);
+	}
+	args.nodes = write_vector(drams, xbar, 256, packed.nodes, heap_address);
+#else
 	args.nodes = write_vector(drams, xbar, 256, bvh.nodes, heap_address);
+#endif
 
 #if USE_HECWBVH_V1
-	args.ftbs = (rtm::FTB*)args.nodes;
+	args.ft_blocks = (rtm::FTB*)args.nodes;
 #else 
-	args.ft_blocks = write_vector(drams, xbar, 256, bvh.ftbs, heap_address);
+	if(compact_ftb)
+	{
+		args.ft_blocks = reinterpret_cast<rtm::FTB*>(write_vector(drams, xbar, 256, packed.payload, heap_address));
+		// Reserve the original arena span so every following allocation keeps its old address.
+		heap_address = (paddr_t)args.ft_blocks + bvh.ftbs.size() * sizeof(rtm::FTB);
+	}
+	else args.ft_blocks = write_vector(drams, xbar, 256, bvh.ftbs, heap_address);
 #endif
+	const uint64_t reserved_ftb_bytes = bvh.ftbs.size() * sizeof(rtm::FTB);
+	const uint64_t occupied_ftb_bytes = compact_ftb ? packed.payload.size() : reserved_ftb_bytes;
+	if(occupied_ftb_bytes > reserved_ftb_bytes) throw std::runtime_error("Compact FTB exceeded original reserved arena");
+	if(layout_info)
+	{
+		layout_info->ftb_occupied_bytes = occupied_ftb_bytes;
+		if(compact_ftb && sim_config.get_int("ftb-wait-diagnostics"))
+			for(uint32_t id = 0; id < packed.old_id_to_leaf.size(); ++id)
+				if(packed.old_id_to_leaf[id] != ~0u)
+					layout_info->diagnostic_leaf_to_canonical.emplace(packed.old_id_to_leaf[id], id);
+	}
+	printf("FTB Physical Layout: mode=%u version=%u occupied-span=%llu reserved-span=%llu bytes\n", compact_ftb ? 1u : 0u,
+		compact_ftb ? 1u : 0u, (unsigned long long)occupied_ftb_bytes, (unsigned long long)reserved_ftb_bytes);
+	if(compact_ftb)
+	{
+		const auto& stats = packed.stats;
+		printf("FTB Layout Statistics: small-blocks=%llu large-blocks=%llu allocated-block-bytes=%llu alignment-padding=%llu padded-gaps=0 parent-groups=%llu small-parent-groups=%llu alias-FTBs=%llu unreferenced-FTBs=%llu\n",
+			(unsigned long long)stats.small_blocks, (unsigned long long)stats.large_blocks,
+			(unsigned long long)stats.allocated_block_bytes, (unsigned long long)stats.alignment_padding_bytes,
+			(unsigned long long)stats.leaf_parent_groups,
+			(unsigned long long)stats.small_parent_groups, (unsigned long long)stats.alias_ftbs,
+			(unsigned long long)stats.unreferenced_ftbs);
+		printf("FTB Layout Resources: node=64B; pointer=32bits with 25-bit slot + size flag; no extra stack/staging bits; fixed format, no strategy selector/core; no mapping LOAD; existing node-decode latency; logic unsynthesized\n");
+	}
+#if !USE_HECWBVH_V1 && TRAX_USE_RT_CORE
+	const auto& device_nodes = packed.nodes;
+#else
+	const auto& device_nodes = bvh.nodes;
+#endif
+	printf("Physical BVH fingerprint (FNV1a64): nodes=%zu bytes=%zu hash=%016llx; payload-bytes=%llu hash=%016llx\n",
+		device_nodes.size(), device_nodes.size() * sizeof(device_nodes[0]),
+		(unsigned long long)fingerprint(device_nodes.data(), device_nodes.size() * sizeof(device_nodes[0])),
+		(unsigned long long)occupied_ftb_bytes,
+		(unsigned long long)(compact_ftb ? fingerprint(packed.payload.data(), packed.payload.size()) : fingerprint(bvh.ftbs.data(), reserved_ftb_bytes)));
 
 	args.vertex_indices = write_vector(drams, xbar, 256, mesh.vertex_indices, heap_address);
 	args.normal_indices = write_vector(drams, xbar, 256, mesh.normal_indices, heap_address);
@@ -301,6 +432,14 @@ static TRaXKernelArgs initilize_buffers(Units::UnitMainMemoryBase** drams, const
 
 	for(uint32_t i = 0; i < mesh.materials.size(); ++i)
 		mesh.materials[i].albedo_texture.texels = nullptr;  // to not free device memory textures
+	printf("Scene allocation addresses: framebuffer=%llx rays=%llx materials=%llx nodes=%llx FTB=%llx vertex-indices=%llx normal-indices=%llx texcoord-indices=%llx vertices=%llx normals=%llx texcoords=%llx material-indices=%llx heap-end=%llx\n",
+		(unsigned long long)(paddr_t)args.framebuffer, (unsigned long long)(paddr_t)args.rays,
+		(unsigned long long)(paddr_t)args.materials, (unsigned long long)(paddr_t)args.nodes,
+		(unsigned long long)(paddr_t)args.ft_blocks, (unsigned long long)(paddr_t)args.vertex_indices,
+		(unsigned long long)(paddr_t)args.normal_indices, (unsigned long long)(paddr_t)args.tex_coord_indices,
+		(unsigned long long)(paddr_t)args.vertices, (unsigned long long)(paddr_t)args.normals,
+		(unsigned long long)(paddr_t)args.tex_coords, (unsigned long long)(paddr_t)args.material_indices,
+		(unsigned long long)heap_address);
 
 	size_t temp = TRAX_KERNEL_ARGS_ADDRESS;
 	write_array(drams, xbar, 256, (uint8_t*)&args, sizeof(TRaXKernelArgs), temp);
@@ -561,8 +700,21 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	rtc_config.ttp_max_distance = sim_config.get_int("ttp-max-distance");
 	rtc_config.ttp_leaf_prefetch = sim_config.get_int("ttp-leaf-prefetch");
 	rtc_config.prefetch_queue_size = sim_config.get_int("prefetch-queue-size");
+	rtc_config.ftb_wait_diagnostics = sim_config.get_int("ftb-wait-diagnostics");
+	rtc_config.ftb_memory_diagnostics = sim_config.get_int("ftb-memory-diagnostics");
+#if USE_HECWBVH_V1 || !TRAX_USE_RT_CORE
+	constexpr bool compact_ftb = false;
+#else
+	constexpr bool compact_ftb = true;
+#endif
+#if USE_HECWBVH_V1 || !TRAX_USE_RT_CORE
+	if(rtc_config.ftb_wait_diagnostics)
+		throw std::runtime_error("FTB wait diagnostics require the HE2 hardware RT core build");
+#endif
 	l1d_config.pf_mshr_limit = sim_config.get_int("prefetch-mshr-limit");
 	l2_config.pf_mshr_limit = sim_config.get_int("prefetch-mshr-limit");
+	printf("Hardware: cores=%u rays/core=%u RT-demand-ports/core=%u core-MHz=%.3f DRAM-MHz=%.3f\n", num_tms, rtc_config.max_rays, rtc_config.num_cache_ports, core_clock / 1e6, dram_clock / 1e6);
+	printf("Caches: L1/core=%u bytes banks=%u latency=%u MSHRs=%u subentries=%u; L2/partition=%u bytes partitions=%u latency=%u\n", l1d_config.size, l1d_config.num_banks, l1d_config.latency, l1d_config.num_mshr, l1d_config.num_subentries, l2_config.size, num_partitions, l2_config.latency);
 
 	ELF elf(project_folder_path + "src/trax-kernel/riscv/kernel");
 
@@ -586,11 +738,15 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	std::vector<std::vector<Units::UnitSFU*>> sfu_lists; sfu_lists.reserve(num_tms);
 	std::vector<std::vector<Units::UnitMemoryBase*>> mem_lists; mem_lists.reserve(num_tms);
 
-	const bool audit_hits = sim_config.get_int("validate-hits") || !sim_config.get_string("hit-output").empty();
+	const bool audit_hits = sim_config.get_int("validate-hits") || !sim_config.get_string("hit-output").empty() || !sim_config.get_string("id-hit-output").empty();
+	const bool observe_ray_identity = audit_hits || rtc_config.ftb_wait_diagnostics;
 	std::vector<std::vector<HitAuditRecord>> hit_records(num_tms);
 	std::map<std::string, HitReference> expected_hits;
 	std::vector<rtm::Triangle> validation_triangles;
 	std::vector<uint> validation_materials;
+	std::vector<rtm::Ray> original_rays;
+	std::vector<std::vector<std::vector<uint64_t>>> loaded_ray_ids(num_tms,
+		std::vector<std::vector<uint64_t>>(num_tps, std::vector<uint64_t>(num_threads, ~0ull)));
 
 	//construct memory partitions
 	std::vector<UnitDRAM*> drams;
@@ -600,6 +756,7 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	for(uint i = 0; i < num_partitions; ++i)
 	{
 		drams.push_back(_new UnitDRAM(dram_config));
+		drams.back()->configure_memory_path_diagnostics(rtc_config.ftb_memory_diagnostics);
 		simulator.register_unit(drams.back());
 
 		l2_config.mem_higher_port = 0;
@@ -623,12 +780,27 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	for(uint addr = 0; addr < heap_address; addr += partition_stride)
 		drams[xbar.get_partition(addr)]->direct_write(vec_mem.data() + addr, partition_stride, xbar.strip_partition_bits(addr));
 
-	TRaXKernelArgs kernel_args = initilize_buffers((Units::UnitMainMemoryBase**)drams.data(), xbar, heap_address, sim_config, partition_stride, sim_config.get_int("validate-hits") ? &expected_hits : nullptr, &validation_triangles, &validation_materials);
+	SceneLayoutInfo scene_layout;
+	TRaXKernelArgs kernel_args = initilize_buffers((Units::UnitMainMemoryBase**)drams.data(), xbar, heap_address, sim_config, partition_stride, sim_config.get_int("validate-hits") ? &expected_hits : nullptr, &validation_triangles, &validation_materials, audit_hits ? &original_rays : nullptr, &scene_layout);
+	if(rtc_config.ftb_wait_diagnostics)
+		rtc_config.canonical_ftb_observer = [&](uint32_t leaf)
+		{
+			if(!compact_ftb) return leaf;
+			const auto it = scene_layout.diagnostic_leaf_to_canonical.find(leaf);
+			return it == scene_layout.diagnostic_leaf_to_canonical.end() ? ~0u : it->second;
+		};
 	heap_address = align_to(partition_stride, heap_address);
 
 	for(uint addr = 0; addr < (256 << 20); addr += partition_stride)
 		drams[xbar.get_partition(addr)]->direct_read(vec_mem.data() + addr, partition_stride, xbar.strip_partition_bits(addr));
 
+	const std::pair<paddr_t, paddr_t> ftb_diagnostic_range = {(paddr_t)kernel_args.ft_blocks, compact_ftb ?
+		(paddr_t)kernel_args.ft_blocks + scene_layout.ftb_occupied_bytes : (paddr_t)kernel_args.vertex_indices};
+	for(uint p = 0; p < l2s.size(); ++p)
+	{
+		l2s[p]->configure_memory_path_diagnostics(rtc_config.ftb_memory_diagnostics, 1000 + p,
+			ftb_diagnostic_range, p, num_partitions, partition_stride);
+	}
 	//bool warm_l2 = false;
 	//if(warm_l2)
 	//{
@@ -662,12 +834,14 @@ static void run_sim_trax(SimulationConfig& sim_config)
 
 		l1d_config.mem_higher_port = tm_index;
 		l1ds.push_back(new UnitL1Cache(l1d_config));
+		l1ds.back()->configure_memory_path_diagnostics(rtc_config.ftb_memory_diagnostics, 1 + tm_index,
+			ftb_diagnostic_range);
 		simulator.register_unit(l1ds.back());
 		mem_list.push_back(l1ds.back());
 		unit_table[(uint)ISA::RISCV::InstrType::LOAD] = l1ds.back();
 		unit_table[(uint)ISA::RISCV::InstrType::STORE] = l1ds.back();
 
-		thread_schedulers.push_back(_new  Units::UnitThreadScheduler(num_tps, tm_index, &atomic_regs, 32));
+		thread_schedulers.push_back(_new Units::UnitThreadScheduler(num_tps, tm_index, &atomic_regs, 32));
 		simulator.register_unit(thread_schedulers.back());
 		mem_list.push_back(thread_schedulers.back());
 		unit_table[(uint)ISA::RISCV::InstrType::CUSTOM0] = thread_schedulers.back();
@@ -717,17 +891,26 @@ static void run_sim_trax(SimulationConfig& sim_config)
 
 	#if TRAX_USE_RT_CORE
 		rtc_config.num_clients = num_tps;
+		rtc_config.memory_path_unit_id = 3000 + tm_index;
 		rtc_config.node_base_addr = (paddr_t)kernel_args.nodes;
 		rtc_config.tri_base_addr = (paddr_t)kernel_args.ft_blocks;
 		rtc_config.cache = l1ds.back();
 		rtc_config.cache_port = num_tps;
 		rtc_config.cache_port_stride = num_tps / l1d_config.num_banks;
 
-		if(audit_hits)
-			rtc_config.hit_observer = [&, tm_index](const rtm::Ray& ray, const rtm::Hit& hit)
+		if(observe_ray_identity)
+		{
+			rtc_config.ray_id_observer = [&, tm_index](const MemoryRequest& request)
 			{
-				hit_records[tm_index].push_back({ray, hit});
+				auto dst = request.dst;
+				const uint thread = dst.pop(4);
+				return loaded_ray_ids[tm_index][request.port][thread];
 			};
+			if(audit_hits) rtc_config.identified_hit_observer = [&, tm_index](uint64_t id, const rtm::Ray& ray, const rtm::Hit& hit)
+			{
+				hit_records[tm_index].push_back({ray, hit, id});
+			};
+		}
 
 		rtcs.push_back(_new  UnitRTCore(rtc_config));
 		simulator.register_unit(rtcs.back());
@@ -750,6 +933,14 @@ static void run_sim_trax(SimulationConfig& sim_config)
 		for(uint tp_index = 0; tp_index < num_tps; ++tp_index)
 		{
 			tp_config.tp_index = tp_index;
+			if(observe_ray_identity && kernel_args.pregen_rays)
+				tp_config.memory_request_observer = [&, tm_index, tp_index](uint thread, ISA::RISCV::InstrType type, const MemoryRequest& request)
+				{
+					const paddr_t begin = (paddr_t)kernel_args.rays;
+					const paddr_t end = begin + uint64_t(kernel_args.framebuffer_size) * sizeof(rtm::Ray);
+					if(type == ISA::RISCV::InstrType::LOAD && request.paddr >= begin && request.paddr < end)
+						loaded_ray_ids[tm_index][tp_index][thread] = (request.paddr - begin) / sizeof(rtm::Ray);
+				};
 			tp_config.unit_table = &unit_tables.back();
 			tps.push_back(new Units::TRaX::UnitTP(tp_config));
 			simulator.register_unit(tps.back());
@@ -858,12 +1049,14 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	delta_log(l2_log, l2s);
 	printf(" L2$ Read: %.1f B/clk (%.2f%%)\n", (float)l2_log.bytes_read / frame_cycles, 100.0f * l2_log.bytes_read / frame_cycles / peak_l2_bandwidth);
 	l2_log.print(frame_cycles);
+	printf("L2 totals: hits=%llu half=%llu misses=%llu bytes=%llu\n", (unsigned long long)l2_log.hits, (unsigned long long)l2_log.half_misses, (unsigned long long)l2_log.misses, (unsigned long long)l2_log.bytes_read);
 	total_power += l2_log.print_power(l2_power_config, frame_time);
 
 	print_header("L1d$");
 	delta_log(l1d_log, l1ds);
 	printf("L1d$ Read: %.1f B/clk (%.2f%%)\n", (float)l1d_log.bytes_read / frame_cycles, 100.0 * l1d_log.bytes_read / frame_cycles / peak_l1d_bandwidth);
 	l1d_log.print(frame_cycles);
+	printf("L1 totals: hits=%llu half=%llu misses=%llu bytes=%llu\n", (unsigned long long)l1d_log.hits, (unsigned long long)l1d_log.half_misses, (unsigned long long)l1d_log.misses, (unsigned long long)l1d_log.bytes_read);
 	total_power += l1d_log.print_power(l1d_power_config, frame_time);
 
 	print_header("Texture Unit");
@@ -880,14 +1073,116 @@ static void run_sim_trax(SimulationConfig& sim_config)
 		delta_log(rtc_log, rtcs);
 		rtc_log.print(rtcs.size());
 		printf("RT rays total: %llu\n", (unsigned long long)rtc_log.rays);
+		printf("RT work totals: nodes=%llu FTBs=%llu triangles=%llu restarts=%llu returned=%llu\n", (unsigned long long)rtc_log.nodes, (unsigned long long)rtc_log.strips, (unsigned long long)rtc_log.tris, (unsigned long long)rtc_log.restarts, (unsigned long long)rtc_log.hits_returned);
 		printf("RT node-fetch ray-cycles total: %llu\n", (unsigned long long)rtc_log.node_fetch_ray_cycles);
 		printf("RT tri-fetch ray-cycles total: %llu\n", (unsigned long long)rtc_log.tri_fetch_ray_cycles);
 		printf("RT prefetch candidates total: %llu\n", (unsigned long long)rtc_log.prefetch_candidates);
 		printf("RT prefetch issued sectors total: %llu\n", (unsigned long long)rtc_log.prefetch_issued_sectors);
 	}
+	if(rtc_config.ftb_wait_diagnostics)
+	{
+		const std::string prefix = sim_config.get_string("ftb-wait-output");
+		std::ofstream accesses(prefix + ".ftb.csv"), rays(prefix + ".rays.csv");
+		if(!accesses || !rays) throw std::runtime_error("Cannot open FTB wait diagnostics output");
+		using Wait = Units::TRaX::FTBWaitDiagnostics;
+		Wait::access_header(accesses); Wait::ray_header(rays);
+		Wait::Totals observed;
+		for(uint core = 0; core < rtcs.size(); ++core)
+			observed.accumulate(rtcs[core]->write_ftb_wait_diagnostics(accesses, rays, core));
+		accesses.flush(); rays.flush();
+		if(!accesses || !rays) throw std::runtime_error("Cannot write FTB wait diagnostics output");
+		observed.errors += observed.rays != rtc_log.rays || observed.rays != rtc_log.hits_returned;
+		observed.errors += observed.blocks != rtc_log.ftb_fetch.completed_blocks;
+		observed.errors += observed.sectors != rtc_log.ftb_fetch.demand_sectors_requested || observed.sectors != rtc_log.ftb_fetch.demand_sectors_returned;
+		observed.errors += observed.total_wait != rtc_log.tri_fetch_ray_cycles;
+		printf("FTBWait scope: host-only RT boundary timestamps; full physical64/128B requested upfront; queue=enqueued-to-cache-accepted, service=cache-accepted-to-RT-return; decoder time recorded separately; service does not distinguish L1/L2/DRAM\n");
+		printf("FTBWait resources: no simulated storage/ports/queues; host records retained until execute ends; no per-event file flush\n");
+		printf("FTBWait counts: rays=%llu blocks=%llu sectors=%llu errors=%llu\n", (unsigned long long)observed.rays, (unsigned long long)observed.blocks, (unsigned long long)observed.sectors, (unsigned long long)observed.errors);
+		printf("FTBWait exclusive ray-cycles: initial-queue=%llu physical-delivery=%llu completion-wait=%llu total=%llu\n", (unsigned long long)observed.initial_queue, (unsigned long long)observed.upfront_delivery, (unsigned long long)observed.completion_wait, (unsigned long long)observed.total_wait);
+		printf("FTBWait overlapping diagnostics: sector-queue-sum=%llu sector-service-sum=%llu (do not add these to exclusive ray-cycles)\n", (unsigned long long)observed.sector_queue, (unsigned long long)observed.sector_service);
+		printf("FTBWait return ordering: sector1-before0=%llu\n", (unsigned long long)observed.return1_before0);
+		for(uint32_t code = 0; code < observed.return_order_hist.size(); ++code)
+			if(observed.return_order_hist[code]) printf("FTBWait return-order-hist: base4-code=%u blocks=%llu\n", code, (unsigned long long)observed.return_order_hist[code]);
+		printf("FTBWait milestones: first-admission=%llu last-admission=%llu last-hit=%llu frame-cycles=%llu\n", (unsigned long long)observed.first_admission, (unsigned long long)observed.last_admission, (unsigned long long)observed.last_hit, (unsigned long long)frame_cycles);
+		printf("FTBWait output: %s.ftb.csv %s.rays.csv\n", prefix.c_str(), prefix.c_str());
+		if(observed.errors || observed.last_hit > uint64_t(frame_cycles))
+			throw std::runtime_error("FTB wait diagnostics closure failed");
+		printf("FTBWait closure: PASS\n");
+	}
 
+	if(compact_ftb && rtc_config.ftb_wait_diagnostics)
+	{
+		const std::string path = sim_config.get_string("ftb-wait-output") + ".basic-decode.csv";
+		std::ofstream decodes(path);
+		if(!decodes) throw std::runtime_error("Cannot open FTB basic decode diagnostics output");
+		UnitRTCore::basic_decode_header(decodes);
+		UnitRTCore::BasicDecodeTotals totals{};
+		for(uint core = 0; core < rtcs.size(); ++core)
+		{
+			const auto t = rtcs[core]->write_basic_decode_diagnostics(decodes, core);
+			totals.blocks += t.blocks; totals.errors += t.errors;
+			totals.decode_cycles += t.decode_cycles;
+			totals.ready_to_first_issue += t.ready_to_first_issue;
+		}
+		decodes.flush();
+		if(!decodes) throw std::runtime_error("Cannot write FTB basic decode diagnostics output");
+		const auto& model = rtc_log.ftb_basic_decode;
+		totals.errors += totals.blocks != rtc_log.strips || totals.blocks != rtc_log.ftb_fetch.completed_blocks;
+		totals.errors += totals.blocks != model.started || totals.blocks != model.completed || totals.blocks != model.first_issues;
+		totals.errors += totals.decode_cycles != 2 * totals.blocks || totals.decode_cycles != model.service_ray_cycles;
+		totals.errors += model.ready_per_port_cycle_max > 1;
+		printf("FTBBasicDecode counts: blocks=%llu errors=%llu decode-cycles=%llu ready-to-first-issue=%llu\n",
+			(unsigned long long)totals.blocks, (unsigned long long)totals.errors,
+			(unsigned long long)totals.decode_cycles, (unsigned long long)totals.ready_to_first_issue);
+		printf("FTBBasicDecode output: %s\n", path.c_str());
+		if(totals.errors) throw std::runtime_error("FTB basic decode diagnostics closure failed");
+		printf("FTBBasicDecode closure: PASS\n");
+	}
+	if(rtc_config.ftb_memory_diagnostics)
+	{
+		const std::string prefix = sim_config.get_string("ftb-wait-output");
+		std::ofstream origins(prefix + ".origins.csv"), cache_requests(prefix + ".cache.csv"),
+			cache_fills(prefix + ".fills.csv"), dram_requests(prefix + ".dram.csv");
+		if(!origins || !cache_requests || !cache_fills || !dram_requests)
+			throw std::runtime_error("Cannot open FTB memory diagnostics output");
+		Units::TRaX::MemoryPathOrigins::header(origins);
+		UnitL1Cache::memory_path_headers(cache_requests, cache_fills);
+		UnitDRAM::memory_path_header(dram_requests);
+		uint64_t count = 0, errors = 0, service = 0, requests = 0, fills = 0, transactions = 0, callbacks = 0, emitted = 0;
+		uint64_t incomplete_requests = 0, incomplete_fills = 0;
+		for(uint core = 0; core < rtcs.size(); ++core)
+		{
+			const auto t = rtcs[core]->write_memory_path_diagnostics(origins, core);
+			count += t.origins; errors += t.errors; service += t.service_cycles;
+		}
+		for(const auto& caches : {l1ds, l2s}) for(const auto* cache : caches)
+		{
+			const auto t = cache->write_memory_path_diagnostics(cache_requests, cache_fills);
+			requests += t.requests; fills += t.fills; errors += t.errors;
+			incomplete_requests += t.incomplete_requests; incomplete_fills += t.incomplete_fills;
+		}
+		for(uint p = 0; p < drams.size(); ++p)
+		{
+			const auto t = drams[p]->write_memory_path_diagnostics(dram_requests, p);
+			transactions += t.transactions; callbacks += t.callbacks; emitted += t.emitted; errors += t.errors;
+		}
+		origins.flush(); cache_requests.flush(); cache_fills.flush(); dram_requests.flush();
+		if(!origins || !cache_requests || !cache_fills || !dram_requests)
+			throw std::runtime_error("Cannot write FTB memory diagnostics output");
+		errors += count != rtc_log.ftb_fetch.demand_sectors_requested;
+		printf("FTBMem counts: origins=%llu cache-requests=%llu fills=%llu DRAM-loads=%llu callbacks=%llu emitted=%llu errors=%llu\n",
+			(unsigned long long)count, (unsigned long long)requests, (unsigned long long)fills, (unsigned long long)transactions,
+			(unsigned long long)callbacks, (unsigned long long)emitted, (unsigned long long)errors);
+		printf("FTBMem RT sector-service ray-cycles: %llu\n", (unsigned long long)service);
+		printf("FTBMem frame-end censored: cache-requests=%llu fills=%llu (speculative work does not extend original termination)\n",
+			(unsigned long long)incomplete_requests, (unsigned long long)incomplete_fills);
+		printf("FTBMem host object sizes: request=%zu return=%zu bytes; payload=%u bytes; metadata has no modeled wire or storage cost\n",
+			sizeof(MemoryRequest), sizeof(MemoryReturn), MemoryRequest::MAX_SIZE);
+		printf("FTBMem scope: host metadata only; cache emit is return-network injection; DRAM callback is interface-ready, not pure bus latency; store completion unchanged\n");
+		if(errors) throw std::runtime_error("FTB memory diagnostics local closure failed");
+		printf("FTBMem closure: PASS\n");
+	}
 	float total_energy = total_power * frame_time;
-
 	print_header("Performance Summary");
 	printf("Cycles: %lld\n", simulator.current_cycle);
 	printf("Clock rate: %.0f MHz\n", core_clock / 1'000'000.0);
@@ -914,10 +1209,18 @@ static void run_sim_trax(SimulationConfig& sim_config)
 		std::vector<std::array<uint32_t, 12>> sorted_hits;
 		uint64_t mismatches = 0;
 		uint64_t equivalent_ties = 0;
+		uint64_t identity_mismatches = 0;
+		std::vector<bool> seen_ids(kernel_args.framebuffer_size, false);
+		std::vector<HitAuditRecord> identified_hits;
 		for(const auto& records : hit_records)
 			for(const auto& record : records)
 			{
 				std::array<uint32_t, 12> bits{};
+				identified_hits.push_back(record);
+				const uint64_t id = record.original_ray_id;
+				const bool valid_id = id < original_rays.size() && !seen_ids[id] && ray_key(record.ray) == ray_key(original_rays[id]);
+				if(!valid_id) ++identity_mismatches;
+				if(id < seen_ids.size()) seen_ids[id] = true;
 				static_assert(sizeof(rtm::Ray) == 32 && sizeof(rtm::Hit) == 16);
 				std::memcpy(bits.data(), &record.ray, sizeof(record.ray));
 				std::memcpy(bits.data() + 8, &record.hit, sizeof(record.hit));
@@ -944,6 +1247,25 @@ static void run_sim_trax(SimulationConfig& sim_config)
 				}
 			}
 		std::sort(sorted_hits.begin(), sorted_hits.end());
+		const auto id_output_path = sim_config.get_string("id-hit-output");
+		if(!id_output_path.empty())
+		{
+			std::sort(identified_hits.begin(), identified_hits.end(), [](const HitAuditRecord& a, const HitAuditRecord& b) { return a.original_ray_id < b.original_ray_id; });
+			std::ofstream output(id_output_path);
+			if(!output) throw std::runtime_error("Cannot write identified hits: " + id_output_path);
+			output << "# original_ray_id decimal, ray[8], hit[4] uint32 hex\n";
+			for(const auto& record : identified_hits)
+			{
+				std::array<uint32_t, 12> bits{};
+				std::memcpy(bits.data(), &record.ray, sizeof(record.ray));
+				std::memcpy(bits.data() + 8, &record.hit, sizeof(record.hit));
+				output << std::dec << record.original_ray_id;
+				for(const auto bit : bits) output << ',' << std::hex << std::setw(8) << std::setfill('0') << bit;
+				output << '\n';
+			}
+			output.close();
+			if(!output) throw std::runtime_error("Cannot finish identified hits: " + id_output_path);
+		}
 		const auto output_path = sim_config.get_string("hit-output");
 		if(!output_path.empty())
 		{
@@ -960,6 +1282,9 @@ static void run_sim_trax(SimulationConfig& sim_config)
 		if(sim_config.get_int("validate-hits"))
 		{
 			bool complete = sorted_hits.size() == kernel_args.framebuffer_size;
+			const bool identities_complete = std::all_of(seen_ids.begin(), seen_ids.end(), [](bool seen) { return seen; });
+			printf("Ray identity validation: %llu mismatches, %s\n", (unsigned long long)identity_mismatches, identities_complete && !identity_mismatches ? "PASS" : "FAIL");
+			complete = complete && identities_complete && !identity_mismatches;
 			for(const auto& reference : expected_hits) complete = complete && reference.second.count == 0;
 			printf("Geometry-confirmed equivalent hits: %llu\n", (unsigned long long)equivalent_ties);
 			printf("Hit validation: %zu/%u rays, %llu mismatches, %s\n", sorted_hits.size(), kernel_args.framebuffer_size,
