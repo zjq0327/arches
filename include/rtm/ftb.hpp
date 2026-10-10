@@ -87,9 +87,10 @@ inline bool compress(uint prim_idx, uint prim_cnt, const Mesh& mesh, FTB* block 
 		block->data.write(block_ptr, ni, index_buffer[i][2]); block_ptr += ni;
 	}
 
-	block->data.write(block_ptr, px, as_u32(vertex_buffer[0].x) >> nx); block_ptr += px;
-	block->data.write(block_ptr, py, as_u32(vertex_buffer[0].y) >> ny); block_ptr += py;
-	block->data.write(block_ptr, pz, as_u32(vertex_buffer[0].z) >> nz); block_ptr += pz;
+	// Canonical nx/ny/nz can be 32 when the prefix is empty.
+	block->data.write(block_ptr, px, uint64_t(as_u32(vertex_buffer[0].x)) >> nx); block_ptr += px;
+	block->data.write(block_ptr, py, uint64_t(as_u32(vertex_buffer[0].y)) >> ny); block_ptr += py;
+	block->data.write(block_ptr, pz, uint64_t(as_u32(vertex_buffer[0].z)) >> nz); block_ptr += pz;
 
 	for(uint i = 0; i < num_vrts; ++i)
 	{

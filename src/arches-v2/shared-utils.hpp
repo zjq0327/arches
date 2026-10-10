@@ -243,6 +243,12 @@ public:
 		set_param("pregen-bounce", 1);
 		set_param("bvh-preset", 0);
 		set_param("bvh-merging", 0);
+		set_param("bvh-leaf-grouping", 0); // Build-time fixed-count HE2 leaf partition search.
+		set_param("bvh-leaf-triangle-cost", 0.5f);
+		set_param("bvh-leaf-sector-cost", 1.0f);
+		set_param("bvh-leaf-fixed-cost", 12.5f);
+		set_param("bvh-leaf-preserve-stride", 0);
+		set_param("bvh-leaf-pareto-filter", 0);
 
 		for(uint i = 1; i < argc; ++i)
 		{
@@ -258,6 +264,26 @@ public:
 			std::string value = arg.substr(split_pos, arg.size() - split_pos);
 
 			parse_param(key, value);
+		}
+
+		if(get_int("bvh-leaf-grouping") < 0 || get_int("bvh-leaf-grouping") > 1 ||
+		   (get_int("bvh-leaf-grouping") && (get_string("arch-name") != "TRaX" ||
+		      get_int("bvh-preset") != 0 || get_int("bvh-merging") != 0)))
+		{
+			fprintf(stderr, "bvh-leaf-grouping must be 0/1; enabled requires TRaX preset=0 merging=0\n");
+			std::exit(EXIT_FAILURE);
+		}
+		const float leaf_triangle = get_float("bvh-leaf-triangle-cost");
+		const float leaf_sector = get_float("bvh-leaf-sector-cost");
+		const float leaf_fixed = get_float("bvh-leaf-fixed-cost");
+		if(!std::isfinite(leaf_triangle) || !std::isfinite(leaf_sector) || !std::isfinite(leaf_fixed) ||
+		   leaf_triangle < 0 || leaf_sector < 0 || leaf_fixed < 0 ||
+		   double(leaf_triangle) + leaf_sector + leaf_fixed <= 0 ||
+		   get_int("bvh-leaf-preserve-stride") < 0 || get_int("bvh-leaf-preserve-stride") > 1 ||
+		   get_int("bvh-leaf-pareto-filter") < 0 || get_int("bvh-leaf-pareto-filter") > 1)
+		{
+			fprintf(stderr, "Leaf costs must be finite, nonnegative, not all zero; stride/pareto flags must be 0/1\n");
+			std::exit(EXIT_FAILURE);
 		}
 
 		if(get_int("prefetch-queue-size") < 2 || get_int("prefetch-mshr-limit") < 0)

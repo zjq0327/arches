@@ -8,6 +8,7 @@
 #include "ray-input.hpp"
 #include "rtm/compact-ftb.hpp"
 #include "rtm/ftb-prefix.hpp"
+#include "rtm/leaf-grouping.hpp"
 #include "units/trax/unit-tp.hpp"
 #include "units/trax/unit-rt-core.hpp"
 #include "trax-kernel/include.hpp"
@@ -233,6 +234,10 @@ static bool equivalent_hit_tie(const HitAuditRecord& record, const rtm::Hit& ref
 
 static TRaXKernelArgs initilize_buffers(Units::UnitMainMemoryBase** drams, const Units::UnitCrossbar& xbar, paddr_t& heap_address, const SimulationConfig& sim_config, uint page_size, std::map<std::string, HitReference>* expected_hits = nullptr, std::vector<rtm::Triangle>* validation_triangles = nullptr, std::vector<uint>* validation_materials = nullptr, std::vector<rtm::Ray>* original_rays = nullptr, SceneLayoutInfo* layout_info = nullptr)
 {
+#if USE_HECWBVH_V1 || !TRAX_USE_RT_CORE
+	if(sim_config.get_int("bvh-leaf-grouping"))
+		throw std::invalid_argument("Leaf grouping requires the HE2 hardware RT core build");
+#endif
 #if !USE_HECWBVH_V1 && TRAX_USE_RT_CORE
 	// Keep the selected compact format's verified canonical BVH contract.
 	if(sim_config.get_int("bvh-preset") != 0 || sim_config.get_int("bvh-merging") != 0)
@@ -321,8 +326,31 @@ static TRaXKernelArgs initilize_buffers(Units::UnitMainMemoryBase** drams, const
 #endif
 	rtm::compact_ftb::Layout packed;
 #if !USE_HECWBVH_V1 && TRAX_USE_RT_CORE
-	// Transform only the device representation. Canonical geometry, grouping,
-	// ray generation and the native oracle keep the original bvh.ftbs array.
+	// Generate rays and native references above from the unmodified baseline.
+	// Regroup only the build-time device source, retaining mesh primitive IDs.
+	if(sim_config.get_int("bvh-leaf-grouping"))
+	{
+		const rtm::leaf_grouping::Costs costs{sim_config.get_float("bvh-leaf-triangle-cost"),
+			sim_config.get_float("bvh-leaf-sector-cost"), sim_config.get_float("bvh-leaf-fixed-cost"),
+			bool(sim_config.get_int("bvh-leaf-preserve-stride")), bool(sim_config.get_int("bvh-leaf-pareto-filter"))};
+		const auto stats = rtm::leaf_grouping::apply(bvh.nodes, bvh.ftbs, mesh, costs);
+		printf("Leaf Grouping: mode=1 cap=3 fixed-parent-leaf-count=1 eligible=%llu searchable=%llu changed-parents=%llu changed-FTBs=%llu rejected-candidates=%llu skipped-mixed=%llu skipped-shared=%llu skipped-interval=%llu baseline-proxy=%.12g selected-proxy=%.12g host-build-us=%llu\n",
+			(unsigned long long)stats.eligible, (unsigned long long)stats.searchable,
+			(unsigned long long)stats.changed_parents, (unsigned long long)stats.changed_blocks,
+			(unsigned long long)stats.rejected_candidates, (unsigned long long)stats.skipped_mixed,
+			(unsigned long long)stats.skipped_shared, (unsigned long long)stats.skipped_interval,
+			stats.baseline_cost, stats.selected_cost, (unsigned long long)stats.elapsed_us);
+		printf("Leaf Grouping Validation: primitives=%llu exact-cover=1 FP32-bit-exact=1 conservative-boxes=1 PASS; mesh/index order, node grid/masks/bases and array counts unchanged\n", (unsigned long long)stats.checked_primitives);
+		printf("Grouped BVH fingerprint (FNV1a64): nodes=%zu hash=%016llx FTBs=%zu hash=%016llx\n",
+			bvh.nodes.size(), (unsigned long long)fingerprint(bvh.nodes.data(), bvh.nodes.size() * sizeof(bvh.nodes[0])),
+			bvh.ftbs.size(), (unsigned long long)fingerprint(bvh.ftbs.data(), bvh.ftbs.size() * sizeof(bvh.ftbs[0])));
+		printf("Leaf Grouping Cost: quantized-area*(%.9g*triangles+%.9g*physical32B-sectors+%.9g); preserve-stride=%u pareto-filter=%u filtered-plans=%llu triangle-proxy=%.12g->%.12g sector-proxy=%.12g->%.12g; geometric proxy, no ray-specific tuning; added device resources=0\n",
+			costs.triangle, costs.sector, costs.leaf, unsigned(costs.preserve_stride), unsigned(costs.pareto_filter),
+			(unsigned long long)stats.filtered_plans, stats.baseline_triangles, stats.selected_triangles,
+			stats.baseline_sectors, stats.selected_sectors);
+	}
+	else printf("Leaf Grouping: mode=0 baseline\n");
+	// Preserve the existing lossless prefix format and physical allocation path.
 	const auto prefix = rtm::ftb_prefix::transform(bvh.ftbs);
 	const auto& prefix_stats = prefix.stats;
 	printf("FTB Prefix Codec: mode=1 version=1 blocks=%llu changed-blocks=%llu encoded-size-changed-blocks=%llu nonzero-prefix-blocks=%llu old-bits=%llu new-bits=%llu old-byte-ceil=%llu new-byte-ceil=%llu\n",
@@ -340,6 +368,24 @@ static TRaXKernelArgs initilize_buffers(Units::UnitMainMemoryBase** drams, const
 	printf("FTB Strategy: packed parent groups; lossless prefix; full physical64/128B upfront; basic decode2 after full-data admission\n");
 	printf("FTB Basic Decode Model: fixed two global cycles from full-data admission; original scalar rtm::decompress consumer; existing128B staging retained; modeled latency assumption, logic/ports/area/1515MHz timing unsynthesized\n");
 	packed = rtm::compact_ftb::build(bvh.nodes, prefix.ftbs);
+	if(sim_config.get_int("ftb-wait-diagnostics"))
+	{
+		const auto path = sim_config.get_string("ftb-wait-output") + ".layout.csv";
+		std::ofstream map(path);
+		if(!map) throw std::runtime_error("Cannot open FTB layout diagnostics");
+		map << "canonical_ftb_id,prim_idx,triangle_count,required_bytes,physical_bytes,payload_offset,encoded_leaf_id,slot,encoded_block_FNV1a64\n";
+		for(uint32_t id = 0; id < prefix.ftbs.size(); ++id)
+		{
+			const uint32_t encoded = packed.old_id_to_leaf[id];
+			map << id << ',' << prefix.ftbs[id].prim_idx << ',' << uint32_t(prefix.ftbs[id].tri_cnt + 1) << ','
+				<< rtm::compact_ftb::required_bytes(prefix.ftbs[id]) << ',' << rtm::compact_ftb::leaf_bytes(encoded) << ','
+				<< uint64_t(rtm::compact_ftb::leaf_slot(encoded)) * 64 << ',' << encoded << ','
+				<< rtm::compact_ftb::leaf_slot(encoded) << ',' << std::hex
+				<< rtm::ftb_prefix::fingerprint(&prefix.ftbs[id], sizeof(rtm::FTB)) << std::dec << '\n';
+		}
+		if(!map) throw std::runtime_error("Cannot write FTB layout diagnostics");
+	}
+
 	if(expected_hits)
 	{
 		for(uint i = 0; i < args.framebuffer_size; ++i)

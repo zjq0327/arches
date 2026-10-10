@@ -112,9 +112,13 @@ public:
 	{
 		uint32_t x = iuv[0] % width;
 		uint32_t y = iuv[1] % height;
-	#if 0
-		return &texels[y * width + x];
-	#else
+		// Keep the dense Morton layout for square or 2:1 power-of-two textures.
+		// Other dimensions must stay within the width * height allocation
+		// copied to simulated memory. Host loading and sampling share this layout.
+		const bool dense_shape = width == height || (width >= 2 && width / 2 == height);
+		if(!dense_shape || width > 65536 || (width & (width - 1)) != 0)
+			return &texels[y * width + x];
+
 		static const uint32_t B[] = {0x55555555, 0x33333333, 0x0F0F0F0F, 0x00FF00FF};
 		static const uint32_t S[] = {1, 2, 4, 8};
 
@@ -129,7 +133,6 @@ public:
 		y = (y | (y << S[0])) & B[0];
 
 		return &texels[x | (y << 1)];
-	#endif
 	}
 
 	static rtm::vec4 decode_texel(const Texel& texel)

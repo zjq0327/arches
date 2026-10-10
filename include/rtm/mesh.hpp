@@ -442,7 +442,9 @@ public:
 			uint8_t type = data[index] + data[index + 1];
 
 			//advance to start of data
+			const size_t directive_start = index;
 			while(data[index] != ' ') index++;
+			const size_t directive_length = index - directive_start;
 			while(data[index] == ' ') index++;
 
 			switch(type)
@@ -510,7 +512,7 @@ public:
 
 			case map_x: //na
 			{
-				if(data[index - 2] == 'd') //map_Kd
+				if(std::string(data + directive_start, directive_length) == "map_Kd")
 				{
 					std::string str = swap_path(read_str(data, index), texture_path);
 					materials.back().albedo_texture = Texture2D(str);
